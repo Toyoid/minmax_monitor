@@ -227,14 +227,21 @@ class MonitorModel:
         return self.tokenizer
     
     def save_model(self, save_path: str):
-        """Save the monitor model"""
-        if hasattr(self.model, 'save_pretrained'):
-            self.model.save_pretrained(save_path)
-        else:
-            # Handle PEFT models
-            self.model.save_pretrained(save_path)
+        """
+        Save the monitor model (handles both LoRA and full model saving)
         
+        Args:
+            save_path: Directory path to save the model
+        """
+        import os
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save the model (LoRA adapters if using PEFT)
+        self.model.save_pretrained(save_path)
+        
+        # Save the tokenizer
         self.tokenizer.save_pretrained(save_path)
+        
         logger.info(f"Monitor model saved to {save_path}")
     
     def load_model(self, load_path: str):

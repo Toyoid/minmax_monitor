@@ -10,7 +10,7 @@ dependencies:
   - python=3.11
   
   # PyTorch and CUDA (adjust CUDA version as needed)
-  - pytorch>=2.0.0
+  - pytorch=2.5.1
   - torchvision
   - torchaudio
   - pytorch-cuda=12.1  # or 12.1 depending on your GPU
@@ -52,7 +52,7 @@ dependencies:
     - deepspeed
     
     # RL training libraries
-    - trl  # Transformers Reinforcement Learning
+    - trl=0.11.3  # Transformers Reinforcement Learning
     
     # Additional useful packages
     - bitsandbytes  # 8-bit optimizers

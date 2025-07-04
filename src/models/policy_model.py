@@ -177,3 +177,32 @@ class PolicyModel:
     def get_device(self) -> str:
         """Get the device this model is loaded on"""
         return self.target_device
+    
+    def save_model(self, save_path: str):
+        """
+        Save the policy model (handles both LoRA and full model saving)
+        
+        Args:
+            save_path: Directory path to save the model
+        """
+        import os
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save the model (LoRA adapters if using PEFT)
+        self.model.save_pretrained(save_path)
+        
+        # Save the tokenizer
+        self.tokenizer.save_pretrained(save_path)
+        
+        logger.info(f"Policy model saved to {save_path}")
+    
+    def load_model(self, load_path: str):
+        """
+        Load a saved policy model
+        
+        Args:
+            load_path: Directory path to load the model from
+        """
+        # This would implement loading logic for fine-tuned policy models
+        logger.info(f"Loading policy model from {load_path}")
+        # Implementation depends on whether using LoRA or full fine-tuning
