@@ -25,6 +25,7 @@ from src.models.policy_model import PolicyModel
 from src.models.reward_model import RewardModel
 from src.models.judge_model import JudgeModel
 from src.pipelines.rlhf_pipeline import RLHFPipeline
+from src.utils.metrics_logger import MetricsLogger
 
 # TRL imports for PPO training
 try:
@@ -62,14 +63,19 @@ class RLHFTrainer:
         
         # Load configuration
         with open(config_path) as f:
-            self.config_dict = json.load(f)
+            config_dict = json.load(f)
+        
+        self.config = RLHFConfig.from_dict(config_dict)
         
         # Initialize device manager (simplified)
         self.device_manager = create_device_manager()
         
         self.device = torch.device(self.device_manager.get_policy_device())
-        self.save_dir = self.config_dict.get("save_dir", "./outputs")
+        self.save_dir = self.config.save_dir
         os.makedirs(self.save_dir, exist_ok=True)
+        
+        # Initialize MetricsLogger
+        self._setup_metrics_logger()
         
         # Initialize components
         self._setup_dataset_config()
@@ -82,11 +88,38 @@ class RLHFTrainer:
         
         logger.info("Dataset-agnostic RLHF trainer initialized successfully")
     
+    def _setup_metrics_logger(self):
+        """Setup MetricsLogger for wandb integration"""
+        # Extract wandb config from training config if available
+        wandb_config = getattr(self.config, 'wandb', {})
+        
+        # Create run name with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"rlhf_{self.dataset_name}_{timestamp}"
+        
+        # Get project name from config or use default
+        project_name = wandb_config.get('project', 'rlhf-training')
+        
+        # Initialize MetricsLogger
+        try:
+            self.metrics_logger = MetricsLogger(
+                project_name=project_name,
+                run_name=run_name,
+                config=self.config.to_dict(),
+                trainer_type="rlhf",
+                wandb_config=wandb_config
+            )
+            logger.info("MetricsLogger initialized for RLHF training")
+        except Exception as e:
+            logger.warning(f"Failed to initialize MetricsLogger: {e}. Training will continue without wandb logging.")
+            self.metrics_logger = None
+    
     def _setup_dataset_config(self):
         """Setup dataset-specific configuration"""
         if self.dataset_name == "qa_simple":
             self.dataset_config = QASimpleConfig()
-            self.data_dir = self.config_dict["data"]["data_dir"]
+            self.data_dir = self.config.data.data_dir
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
         
@@ -97,7 +130,7 @@ class RLHFTrainer:
         logger.info("Loading models with distributed device placement...")
         
         # Create model configs
-        policy_config, reward_config, judge_config = create_model_configs_from_dict(self.config_dict)
+        policy_config, reward_config, judge_config = create_model_configs_from_dict(self.config.to_dict())
         
         # Initialize models on allocated devices
         self.policy_model = PolicyModel(
@@ -139,13 +172,19 @@ class RLHFTrainer:
             self.device_manager  # Add device manager
         )
         
+        # Set reward weights from config
+        self.pipeline.set_reward_weights(
+            self.config.training.reward_weight,
+            self.config.training.judge_weight
+        )
+        
         logger.info("RLHF pipeline initialized")
     
     def _setup_data(self):
         """Setup data loaders"""
         logger.info("Setting up data loaders...")
         
-        batch_size = self.config_dict["training"]["batch_size"]
+        batch_size = self.config.training.batch_size
         
         # Training data
         self.train_dataloader = create_qa_simple_dataloader(
@@ -161,7 +200,7 @@ class RLHFTrainer:
                    f"Val: {len(self.val_dataloader.dataset)} samples")
         
         # Log training sample limit if set
-        num_train_samples = self.config_dict["training"].get("num_train_samples", None)
+        num_train_samples = self.config.training.num_train_samples
         if num_train_samples is not None:
             logger.info(f"Training sample limit set to: {num_train_samples}")
         else:
@@ -173,17 +212,17 @@ class RLHFTrainer:
         
         # PPO Configuration with memory optimization
         ppo_config = PPOConfig(
-            model_name=self.config_dict["policy_model"]["model_name"],
-            learning_rate=self.config_dict["training"]["learning_rate"],
-            batch_size=self.config_dict["training"]["mini_batch_size"],
-            mini_batch_size=self.config_dict["training"]["mini_batch_size"],
-            ppo_epochs=self.config_dict["training"]["ppo_epochs"],
-            init_kl_coef=self.config_dict["training"]["init_kl_coef"],
-            target_kl=self.config_dict["training"]["target_kl"],
-            cliprange=self.config_dict["training"]["cliprange"],
-            cliprange_value=self.config_dict["training"]["cliprange_value"],
-            vf_coef=self.config_dict["training"]["vf_coef"],
-            max_grad_norm=self.config_dict["training"]["max_grad_norm"],
+            model_name=self.config.policy_model.model_name,
+            learning_rate=self.config.training.learning_rate,
+            batch_size=self.config.training.mini_batch_size,
+            mini_batch_size=self.config.training.mini_batch_size,
+            ppo_epochs=self.config.training.ppo_epochs,
+            init_kl_coef=self.config.training.init_kl_coef,
+            target_kl=self.config.training.target_kl,
+            cliprange=self.config.training.cliprange,
+            cliprange_value=self.config.training.cliprange_value,
+            vf_coef=self.config.training.vf_coef,
+            max_grad_norm=self.config.training.max_grad_norm,
             # Memory optimization settings
             gradient_checkpointing=True,  # Reduce memory at cost of compute
             optimize_cuda_cache=True,
@@ -214,7 +253,7 @@ class RLHFTrainer:
     
     def train(self, num_epochs: Optional[int] = None):
         """
-        Main training loop
+        Main training loop with comprehensive metrics logging
         """
         if self.eval_only:
             logger.info("Running in evaluation-only mode")
@@ -223,7 +262,7 @@ class RLHFTrainer:
         if not TRL_AVAILABLE:
             raise RuntimeError("TRL is required for training. Install with: pip install trl")
         
-        num_epochs = num_epochs or self.config_dict["training"]["num_epochs"]
+        num_epochs = num_epochs or self.config.training.num_epochs
         logger.info(f"Starting RLHF training for {num_epochs} epochs")
         
         # Training metrics
@@ -245,30 +284,52 @@ class RLHFTrainer:
             training_stats["epoch_correctness"].append(epoch_metrics["mean_correctness"])
             training_stats["epoch_losses"].append(epoch_metrics["mean_loss"])
             
+            # Log epoch-level metrics to wandb
+            if self.metrics_logger:
+                epoch_wandb_metrics = {
+                    'reward': epoch_metrics["mean_reward"],
+                    'judge_score': epoch_metrics["mean_judge_score"],
+                    'correctness': epoch_metrics["mean_correctness"],
+                    'loss': epoch_metrics["mean_loss"],
+                }
+                self.metrics_logger.log_epoch_metrics(epoch_wandb_metrics, epoch + 1)
+            
             # Evaluation
-            if (epoch + 1) % self.config_dict["training"]["eval_frequency"] == 0:
+            if (epoch + 1) % self.config.training.eval_frequency == 0:
                 logger.info("Running evaluation...")
                 eval_metrics = self.evaluate()
                 logger.info(f"Eval metrics: {eval_metrics}")
+                
+                # Log evaluation metrics to wandb
+                if self.metrics_logger:
+                    self.metrics_logger.log_evaluation_metrics(eval_metrics)
             
             # Save checkpoint
-            if (epoch + 1) % self.config_dict["training"]["save_frequency"] == 0:
+            if (epoch + 1) % self.config.training.save_frequency == 0:
                 self._save_checkpoint(epoch + 1, training_stats)
         
         logger.info("Training completed!")
         return training_stats
     
     def _train_epoch(self):
-        """Train for one epoch"""
+        """Train for one epoch with comprehensive metrics logging"""
+        # Initialize metric collectors
         total_rewards = []
         total_judge_scores = []
         total_correctness = []
         total_losses = []
         
+        # Additional metrics for comprehensive logging
+        reward_scores_all = []
+        judge_scores_all = []
+        policy_correctness_all = []
+        judge_correctness_all = []
+        parsed_answers_all = []
+        
         self.ppo_model.train()
         
         # Check if we should limit the number of training samples
-        num_train_samples = self.config_dict["training"].get("num_train_samples", None)
+        num_train_samples = self.config.training.num_train_samples
         samples_processed = 0
         
         for batch_idx, batch in enumerate(self.train_dataloader):
@@ -290,11 +351,22 @@ class RLHFTrainer:
                     max_new_tokens=self.config.policy_model.max_new_tokens // 4
                 )
                 
-                # Compute combined reward
-                combined_rewards = self._compute_combined_reward(rlhf_output)
+                # Compute combined reward (moved to pipeline)
+                combined_rewards = self.pipeline.compute_combined_reward(rlhf_output)
+                
+                # Collect additional metrics for comprehensive analysis
+                reward_scores_all.extend(rlhf_output.reward_scores.cpu().tolist())
+                judge_scores_all.extend(rlhf_output.judge_scores.cpu().tolist())
+                policy_correctness_all.extend(rlhf_output.ground_truth_correct.cpu().tolist())
+                parsed_answers_all.extend(rlhf_output.parsed_answers)
+                
+                # Judge correctness: binary threshold on judge scores
+                judge_binary = (rlhf_output.judge_scores > 0.5).float()
+                judge_correctness_batch = (judge_binary == rlhf_output.ground_truth_correct).float()
+                judge_correctness_all.extend(judge_correctness_batch.cpu().tolist())
                 
                 # Split large batch into mini-batches for PPO training
-                mini_batch_size = self.config_dict["training"]["mini_batch_size"]
+                mini_batch_size = self.config.training.mini_batch_size
                 batch_size = len(rlhf_output.policy_input_lengths)
                 
                 # Process in mini-batches
@@ -344,10 +416,34 @@ class RLHFTrainer:
                 total_judge_scores.extend(rlhf_output.judge_scores.cpu().numpy())
                 total_correctness.extend(rlhf_output.ground_truth_correct.cpu().numpy())
                 
-                # Note: total_losses is already collected in the mini-batch loop above
+                # Log comprehensive metrics to wandb every log_frequency batches
+                if self.metrics_logger and batch_idx % self.config.evaluation.log_frequency == 0:
+                    # Compute batch-level metrics
+                    batch_metrics = {
+                        'reward': combined_rewards.mean().item(),
+                        'judge_score': rlhf_output.judge_scores.mean().item(),
+                        'policy_accuracy': rlhf_output.ground_truth_correct.float().mean().item(),
+                        'reward_score_mean': rlhf_output.reward_scores.mean().item(),
+                        'combined_reward_mean': combined_rewards.mean().item(),
+                    }
+                    
+                    if total_losses:
+                        batch_metrics['ppo_loss'] = total_losses[-1]
+                    
+                    # Compute deception metrics for judge
+                    judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
+                        rlhf_output.judge_scores, rlhf_output.ground_truth_correct
+                    )
+                    for key, value in judge_deception_metrics.items():
+                        batch_metrics[f'judge_{key}'] = value
+                    
+                    # Log batch metrics
+                    self.metrics_logger.log_training_batch_metrics(batch_metrics)
+                
+                self.metrics_logger.global_train_step += 1
                 
                 # Log progress
-                if batch_idx % self.config_dict["evaluation"]["log_frequency"] == 0:
+                if batch_idx % self.config.evaluation.log_frequency == 0:
                     logger.info(f"Batch {batch_idx}: "
                               f"Reward={np.mean(combined_rewards.cpu().numpy()):.3f}, "
                               f"Judge={np.mean(rlhf_output.judge_scores.cpu().numpy()):.3f}, "
@@ -364,84 +460,90 @@ class RLHFTrainer:
             "mean_loss": float(np.mean(total_losses)) if total_losses else 0.0
         }
     
-    def _compute_combined_reward(self, rlhf_output):
-        """Compute combined reward from multiple sources"""
-        # Get weights from config
-        reward_weight = self.config_dict["training"]["reward_weight"]
-        judge_weight = self.config_dict["training"]["judge_weight"]
-        
-        # Normalize scores to [-1, 1] range
-        # Reward scores: use tanh to map raw logits to [-1, 1]
-        normalized_reward = torch.tanh(rlhf_output.reward_scores)
-        
-        # Judge scores: already in [-1, 1] range
-        normalized_judge = rlhf_output.judge_scores
-        
-        # Combine rewards
-        combined_reward = (reward_weight * normalized_reward + 
-                          judge_weight * normalized_judge)
-        
-        return combined_reward
-    
     def evaluate(self):
-        """Evaluate the model"""
-        logger.info("Running evaluation...")
+        """Evaluate the model with comprehensive metrics collection"""
+        logger.info("Running RLHF evaluation...")
         
-        total_rewards = []
-        total_judge_scores = []
-        parsing_success_cnt = 0
-        judge_correct_cnt = 0
-        judge_positive_cnt = 0
-        judge_false_pos_cnt = 0
-        judge_false_neg_cnt = 0
-        correct_predictions = 0
-        total_predictions = 0
+        # Collect comprehensive evaluation data
+        all_policy_correctness = []
+        all_judge_scores = []
+        all_reward_scores = []
+        all_combined_scores = []
+        all_parsed_answers = []
+        batch_metrics_list = []
         
         self.ppo_model.eval() if hasattr(self, 'ppo_model') else None
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dataloader):
-                if batch_idx >= self.config_dict["evaluation"]["num_eval_samples"] // \
-                   self.config_dict["training"]["batch_size"]:
+                if batch_idx >= self.config.evaluation.num_eval_samples // \
+                   self.config.training.batch_size:
                     break
                 
                 try:
-                    # Forward pass
-                    # rlhf_output = self.pipeline.forward_pass(batch, max_new_tokens=50)
-                    batch_metrics = self.pipeline.evaluate_batch(batch, max_new_tokens=50)
+                    # Forward pass for evaluation (no training updates)
+                    rlhf_output = self.pipeline.forward_pass(batch, max_new_tokens=50)
                     
-                    # Collect metrics
-                    total_rewards.extend(batch_metrics['reward_scores'])
-                    total_judge_scores.extend(batch_metrics['judge_scores'])
+                    # Compute combined rewards
+                    combined_rewards = self.pipeline.compute_combined_reward(rlhf_output)
                     
-                    # Count correct predictions
-                    parsing_success_cnt += batch_metrics['parsing_success_rate'] * batch_metrics['batch_size']
-                    judge_correct_cnt += batch_metrics['judge_accuracy'] * batch_metrics['batch_size']
-                    judge_positive_cnt += batch_metrics['judge_positive_cnt']
-                    judge_false_pos_cnt += batch_metrics['judge_false_pos_cnt']
-                    judge_false_neg_cnt += batch_metrics['judge_false_neg_cnt']
-
-                    correct_predictions += sum(batch_metrics['ground_truth_correct'])
-                    total_predictions += batch_metrics['batch_size']
-
+                    # Collect data for comprehensive analysis
+                    all_policy_correctness.extend(rlhf_output.ground_truth_correct.cpu().tolist())
+                    all_judge_scores.extend(rlhf_output.judge_scores.cpu().tolist())
+                    all_reward_scores.extend(rlhf_output.reward_scores.cpu().tolist())
+                    all_combined_scores.extend(combined_rewards.cpu().tolist())
+                    all_parsed_answers.extend(rlhf_output.parsed_answers)
+                    
+                    # Compute batch-level metrics for logging
+                    batch_metrics = {
+                        "accuracy": rlhf_output.ground_truth_correct.float().mean().item(),
+                        "avg_reward_score": rlhf_output.reward_scores.mean().item(),
+                        "avg_judge_score": rlhf_output.judge_scores.mean().item(),
+                        "avg_combined_score": combined_rewards.mean().item(),
+                        "parsing_success_rate": np.mean([1.0 if ans in ['A', 'B'] else 0.0 for ans in rlhf_output.parsed_answers]),
+                        "batch_size": len(rlhf_output.parsed_answers),
+                    }
+                    batch_metrics_list.append(batch_metrics)
+                    
+                    logger.debug("Batch %d evaluation metrics: \n%s", batch_idx, json.dumps(batch_metrics, indent=2))
+                    
                 except Exception as e:
                     logger.error(f"Error in eval batch {batch_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
         
-        # Compute metrics
-        eval_metrics = {
-            "mean_reward": np.mean(total_rewards) if total_rewards else 0,
-            "mean_judge_score": np.mean(total_judge_scores) if total_judge_scores else 0,
-            "accuracy": correct_predictions / total_predictions if total_predictions > 0 else 0,
-            "parsing_success_rate": parsing_success_cnt / total_predictions if total_predictions > 0 else 0,
-            "judge_accuracy": judge_correct_cnt / total_predictions if total_predictions > 0 else 0,
-            "judge_positive_rate": judge_positive_cnt / total_predictions if total_predictions > 0 else 0,
-            "judge_false_pos_rate": judge_false_pos_cnt / total_predictions if total_predictions > 0 else 0,
-            "judge_false_neg_rate": judge_false_neg_cnt / total_predictions if total_predictions > 0 else 0,
-            "total_samples": total_predictions
+        # Aggregate basic metrics
+        if not batch_metrics_list:
+            return {"error": "No successful evaluation batches"}
+        
+        # Convert to tensors for metrics computation
+        policy_correctness_tensor = torch.tensor(all_policy_correctness, dtype=torch.float32)
+        judge_scores_tensor = torch.tensor(all_judge_scores, dtype=torch.float32)
+        
+        # Compute comprehensive metrics using MetricsLogger
+        aggregated_metrics = {
+            "accuracy": float(policy_correctness_tensor.mean().item()),
+            "avg_reward_score": float(np.mean(all_reward_scores)),
+            "avg_judge_score": float(np.mean(all_judge_scores)),
+            "avg_combined_score": float(np.mean(all_combined_scores)),
+            "parsing_success_rate": np.mean([m["parsing_success_rate"] for m in batch_metrics_list]),
+            "total_samples": sum([m["batch_size"] for m in batch_metrics_list]),
         }
         
-        return eval_metrics
+        # Add judge deception metrics
+        if self.metrics_logger:
+            judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
+                judge_scores_tensor, policy_correctness_tensor
+            )
+            for key, value in judge_deception_metrics.items():
+                aggregated_metrics[f"judge_{key}"] = value
+            
+            # Add answer distribution
+            answer_distribution = self.metrics_logger.compute_answer_distribution(all_parsed_answers)
+            aggregated_metrics.update(answer_distribution)
+        
+        return aggregated_metrics
     
     def _save_checkpoint(self, epoch: int, training_stats: Dict):
         """Save model checkpoint and training stats"""
@@ -459,7 +561,7 @@ class RLHFTrainer:
         
         # Save config
         with open(os.path.join(checkpoint_dir, "config.json"), 'w') as f:
-            json.dump(self.config_dict, f, indent=2)
+            json.dump(self.config.to_dict(), f, indent=2)
         
         logger.info(f"Checkpoint saved to {checkpoint_dir}")
 

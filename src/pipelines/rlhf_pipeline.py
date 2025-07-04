@@ -293,6 +293,42 @@ class RLHFPipeline:
             'reward_scores': rlhf_batch.reward_scores,
             'judge_scores': rlhf_batch.judge_scores,
         }
+    
+    def compute_combined_reward(self, rlhf_output) -> torch.Tensor:
+        """
+        Compute combined reward from multiple sources using config weights
+        
+        Args:
+            rlhf_output: RLHFBatch containing reward and judge scores
+            
+        Returns:
+            Combined reward tensor
+        """
+        # Import here to avoid circular imports
+        from ..train.rlhf_trainer import RLHFTrainer
+        
+        # Get weights from the trainer's config if available
+        # For now, use default values - this will be passed from trainer
+        reward_weight = getattr(self, '_reward_weight', 0.8)
+        judge_weight = getattr(self, '_judge_weight', 0.2)
+        
+        # Normalize scores to [-1, 1] range
+        # Reward scores: use tanh to map raw logits to [-1, 1]
+        normalized_reward = torch.tanh(rlhf_output.reward_scores)
+        
+        # Judge scores: already in [-1, 1] range
+        normalized_judge = rlhf_output.judge_scores
+        
+        # Combine rewards
+        combined_reward = (reward_weight * normalized_reward + 
+                          judge_weight * normalized_judge)
+        
+        return combined_reward
+    
+    def set_reward_weights(self, reward_weight: float, judge_weight: float):
+        """Set reward combination weights"""
+        self._reward_weight = reward_weight
+        self._judge_weight = judge_weight
 
 
 def create_rlhf_pipeline(policy_model: PolicyModel, reward_model: RewardModel, 

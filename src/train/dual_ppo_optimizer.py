@@ -143,11 +143,20 @@ class DualPPOMinMaxOptimizer:
         """
         # Extract PPO training data
         policy_queries, policy_responses = self._extract_policy_ppo_data(minmax_output)
-        monitor_queries, monitor_responses = self._extract_monitor_ppo_data(minmax_output)
-        
-        # Validate extracted data
-        if len(policy_queries) == 0 or len(policy_responses) == 0 or len(monitor_queries) == 0 or len(monitor_responses) == 0:
+        # Validate extracted policy data
+        if len(policy_queries) == 0 or len(policy_responses) == 0:
             logger.error("No valid policy data extracted for PPO training")
+            return {
+                'policy_loss': 0.0, 'policy_kl': 0.0, 'policy_entropy': 0.0,
+                'monitor_loss': 0.0, 'monitor_kl': 0.0, 'monitor_entropy': 0.0,
+                'avg_violation': 0.0, 'lambda': self.lambda_multiplier,
+                'policy_reward': 0.0, 'monitor_reward': 0.0
+            }
+
+        monitor_queries, monitor_responses = self._extract_monitor_ppo_data(minmax_output)
+        # Validate extracted monitor data
+        if len(monitor_queries) == 0 or len(monitor_responses) == 0:
+            logger.error("No valid monitor data extracted for PPO training")
             return {
                 'policy_loss': 0.0, 'policy_kl': 0.0, 'policy_entropy': 0.0,
                 'monitor_loss': 0.0, 'monitor_kl': 0.0, 'monitor_entropy': 0.0,
@@ -260,30 +269,18 @@ class DualPPOMinMaxOptimizer:
         responses = []
         
         for i, input_len in enumerate(minmax_output.monitor_input_lengths):
-            # # For monitor, we need the full input sequence and generated critique
-            # # The monitor_input_ids contains the full tokenized prompt + generated critique
-            # full_sequence = minmax_output.monitor_input_ids[i]
-            
-            # # Split into query (input prompt) and response (generated critique)
-            # query = full_sequence[:input_len]
-            # response = full_sequence[input_len:]
-            
-            # queries.append(query)
-            # responses.append(response)
-
             try:
                 # Validate index bounds
                 if i >= len(minmax_output.monitor_generated_tokens):
-                    logger.warning(f"Monitor input index {i} out of bounds, skipping")
-                    raise
+                    raise IndexError(f"Monitor input index {i} out of bounds")
                 
                 # The monitor_input_ids contains the full tokenized prompt + generated critique
                 full_sequence = minmax_output.monitor_generated_tokens[i]
                 
                 # Validate sequence length
                 if len(full_sequence) <= input_len:
-                    logger.warning(f"Monitor sequence {i} too short (len={len(full_sequence)}, input_len={input_len}), skipping")
-                    raise
+                    raise ValueError(f"Monitor sequence {i} too short (len={len(full_sequence)}, input_len={input_len}), skipping")
+                    
                 
                 # Split into query (input prompt) and response (generated critique)
                 query = full_sequence[:input_len]
@@ -291,15 +288,13 @@ class DualPPOMinMaxOptimizer:
                 
                 # Validate response is not empty
                 if len(response) == 0:
-                    logger.warning(f"Monitor response {i} is empty, skipping")
-                    raise
+                    raise ValueError(f"Monitor response {i} is empty")
                 
                 # Validate response contains non-padding tokens
                 if self.monitor_model.get_tokenizer().pad_token_id is not None:
                     non_pad_tokens = (response != self.monitor_model.get_tokenizer().pad_token_id).sum()
                     if non_pad_tokens == 0:
-                        logger.warning(f"Monitor response {i} contains only padding tokens, skipping")
-                        raise
+                        raise ValueError(f"Monitor response {i} contains only padding tokens")
                 
                 queries.append(query)
                 responses.append(response)

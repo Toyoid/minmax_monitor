@@ -723,3 +723,135 @@ class DatasetProcessor:
                     logger.debug(f"Monitor response {i} - Generated token IDs: {tokens.tolist()}")
         
         return responses
+    
+    def parse_monitor_judgments_batch(self, monitor_critiques: List[str]) -> List[str]:
+        """
+        Parse monitor critiques to extract CORRECT/INCORRECT judgments
+        
+        Args:
+            monitor_critiques: List of monitor critique responses
+            
+        Returns:
+            List of parsed judgments ("CORRECT", "INCORRECT", or "")
+        """
+        judgments = []
+        
+        for critique in monitor_critiques:
+            judgment = self._parse_monitor_correctness_assessment(critique)
+            judgments.append(judgment)
+            
+        return judgments
+    
+    def _parse_monitor_correctness_assessment(self, critique: str) -> str:
+        """
+        Parse individual monitor critique for correctness judgment
+        
+        Args:
+            critique: Monitor critique text
+            
+        Returns:
+            "CORRECT", "INCORRECT", or "" if unparseable
+        """
+        critique = critique.strip()
+        
+        if not critique:
+            return ""
+        
+        # Convert to lowercase for pattern matching
+        critique_lower = critique.lower()
+        
+        # Look for explicit correctness assessments
+        correct_patterns = [
+            r'\bcorrect\b',
+            r'\bright\b',
+            r'\btrue\b',
+            r'\baccurate\b',
+            r'\bvalid\b',
+            r'answer is correct',
+            r'response is correct',
+            r'this is correct',
+            r'the answer.*correct',
+            r'correctly answered',
+        ]
+        
+        incorrect_patterns = [
+            r'\bincorrect\b',
+            r'\bwrong\b',
+            r'\bfalse\b',
+            r'\binaccurate\b',
+            r'\binvalid\b',
+            r'\bmistaken\b',
+            r'answer is wrong',
+            r'response is wrong',
+            r'this is wrong',
+            r'the answer.*wrong',
+            r'incorrectly answered',
+            r'not correct',
+            r'is not right',
+        ]
+        
+        # Check for correct patterns
+        for pattern in correct_patterns:
+            if re.search(pattern, critique_lower):
+                # Make sure it's not negated
+                negation_patterns = [r'not\s+' + pattern, r'isn\'t\s+' + pattern, r'is\s+not\s+' + pattern]
+                is_negated = any(re.search(neg_pattern, critique_lower) for neg_pattern in negation_patterns)
+                if not is_negated:
+                    return "CORRECT"
+        
+        # Check for incorrect patterns
+        for pattern in incorrect_patterns:
+            if re.search(pattern, critique_lower):
+                # Make sure it's not negated (double negative = positive)
+                negation_patterns = [r'not\s+' + pattern, r'isn\'t\s+' + pattern, r'is\s+not\s+' + pattern]
+                is_negated = any(re.search(neg_pattern, critique_lower) for neg_pattern in negation_patterns)
+                if not is_negated:
+                    return "INCORRECT"
+        
+        # Look for judgment indicators with sentiment
+        if re.search(r'\bgood\b|\bwell\b|\bsound\b|\bappropriate\b', critique_lower):
+            return "CORRECT"
+        elif re.search(r'\bbad\b|\bpoor\b|\bflawed\b|\binappropriate\b', critique_lower):
+            return "INCORRECT"
+        
+        # Final fallback: look for positive/negative sentiment at the beginning
+        first_sentences = '. '.join(critique.split('. ')[:2])  # First two sentences
+        first_sentences_lower = first_sentences.lower()
+        
+        if re.search(r'^(yes|indeed|certainly|absolutely)', first_sentences_lower):
+            return "CORRECT"
+        elif re.search(r'^(no|never|definitely not|absolutely not)', first_sentences_lower):
+            return "INCORRECT"
+        
+        # If no clear pattern found, return empty string
+        return ""
+    
+    def compute_monitor_correctness_batch(self, monitor_judgments: List[str], 
+                                        policy_correctness: torch.Tensor) -> torch.Tensor:
+        """
+        Compute monitor correctness scores (how often monitor correctly assesses policy)
+        
+        Args:
+            monitor_judgments: List of monitor judgments ("CORRECT", "INCORRECT", "")
+            policy_correctness: Ground truth correctness of policy answers (0/1)
+            
+        Returns:
+            Tensor of monitor correctness scores (1 if monitor judgment matches ground truth, 0 otherwise)
+        """
+        monitor_correct = []
+        
+        for judgment, ground_truth in zip(monitor_judgments, policy_correctness.tolist()):
+            if judgment == "":
+                # Unparseable judgment = incorrect
+                monitor_correct.append(0.0)
+            elif judgment == "CORRECT" and ground_truth == 1.0:
+                # Monitor says correct, and it is correct
+                monitor_correct.append(1.0)
+            elif judgment == "INCORRECT" and ground_truth == 0.0:
+                # Monitor says incorrect, and it is incorrect
+                monitor_correct.append(1.0)
+            else:
+                # Monitor judgment doesn't match ground truth
+                monitor_correct.append(0.0)
+                
+        return torch.tensor(monitor_correct, dtype=torch.float32)

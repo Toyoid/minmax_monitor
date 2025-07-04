@@ -1,16 +1,4 @@
 {
-  "device_strategy": {
-    "auto_detect": true,
-    "manual_allocation": {
-      "_comment": "Manual allocation example - only used when auto_detect=false",
-      "policy_device": 0,
-      "reward_devices": [3],
-      "judge_devices": [1],
-      "data_device": 2
-    },
-    "single_gpu_fallback": true,
-    "min_gpus_for_distribution": 3
-  },
   "policy_model": {
     "model_name": "gpt2",
     "load_in_8bit": true,
@@ -24,7 +12,6 @@
     "max_new_tokens": 128
   },
   "reward_model": {
-    "_comment": "OpenAssistant reward model outputs single scalar scores for RLHF",
     "model_name": "OpenAssistant/reward-model-deberta-v3-large-v2",
     "torch_dtype": "bfloat16",
     "max_length": 512
@@ -70,6 +57,14 @@
     "max_question_length": 256,
     "safety_margin": 40
   },
-  "save_dir": "./outputs",
+  "wandb": {
+    "project": "rlhf-training",
+    "entity": null,
+    "tags": ["rlhf", "qa_simple", "gpt2"],
+    "log_frequency": 10,
+    "log_evaluation": true,
+    "mode": "online"
+  },
+  "save_dir": "./outputs/rlhf",
   "seed": 42
 }

@@ -25,6 +25,7 @@ from ..models.reward_model import RewardModel
 from ..models.judge_model import JudgeModel
 from ..pipelines.minmax_pipeline import MinMaxPipeline
 from ..train.dual_ppo_optimizer import DualPPOMinMaxOptimizer
+from ..utils.metrics_logger import MetricsLogger
 
 # Setup logging
 logging.basicConfig(
@@ -72,6 +73,9 @@ class MinMaxTrainer:
         self.save_dir = self.config.save_dir
         os.makedirs(self.save_dir, exist_ok=True)
         
+        # Initialize MetricsLogger
+        self._setup_metrics_logger()
+        
         # Initialize components
         self._setup_dataset_config()
         self._setup_models()
@@ -82,6 +86,33 @@ class MinMaxTrainer:
             self._setup_optimizer()
         
         logger.info("MinMax trainer initialized successfully")
+    
+    def _setup_metrics_logger(self):
+        """Setup MetricsLogger for wandb integration"""
+        # Extract wandb config from training config if available
+        wandb_config = getattr(self.config, 'wandb', {})
+        
+        # Create run name with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"minmax_{self.dataset_name}_{timestamp}"
+        
+        # Get project name from config or use default
+        project_name = wandb_config.get('project', 'minmax-rlhf-training')
+        
+        # Initialize MetricsLogger
+        try:
+            self.metrics_logger = MetricsLogger(
+                project_name=project_name,
+                run_name=run_name,
+                config=self.config.to_dict(),
+                trainer_type="minmax",
+                wandb_config=wandb_config
+            )
+            logger.info("MetricsLogger initialized for MinMax training")
+        except Exception as e:
+            logger.warning(f"Failed to initialize MetricsLogger: {e}. Training will continue without wandb logging.")
+            self.metrics_logger = None
     
     def _setup_dataset_config(self):
         """Setup dataset-specific configuration"""
@@ -231,11 +262,27 @@ class MinMaxTrainer:
             training_stats["epoch_constraint_lambdas"].append(epoch_metrics["mean_lambda"])
             training_stats["epoch_accuracies"].append(epoch_metrics["mean_accuracy"])
             
+            # Log epoch-level metrics to wandb
+            if self.metrics_logger:
+                epoch_wandb_metrics = {
+                    'policy_loss': epoch_metrics["mean_policy_loss"],
+                    'monitor_loss': epoch_metrics["mean_monitor_loss"],
+                    'combined_reward': epoch_metrics["mean_combined_reward"],
+                    'truthfulness_penalty': epoch_metrics["mean_truthfulness_penalty"],
+                    'lambda': epoch_metrics["mean_lambda"],
+                    'accuracy': epoch_metrics["mean_accuracy"],
+                }
+                self.metrics_logger.log_epoch_metrics(epoch_wandb_metrics, epoch + 1)
+            
             # Evaluation
             if (epoch + 1) % self.config.training.eval_frequency == 0:
                 logger.info("Running evaluation...")
                 eval_metrics = self.evaluate()
                 logger.info(f"Eval accuracy: {eval_metrics['accuracy']:.3f}")
+                
+                # Log evaluation metrics to wandb
+                if self.metrics_logger:
+                    self.metrics_logger.log_evaluation_metrics(eval_metrics)
             
             # Save checkpoint
             if (epoch + 1) % self.config.training.save_frequency == 0:
@@ -246,17 +293,26 @@ class MinMaxTrainer:
     
     def _train_epoch(self) -> Dict[str, float]:
         """
-        Train for one epoch using TTUR dynamics
+        Train for one epoch using TTUR dynamics with comprehensive metrics logging
         
         Returns:
             Dictionary with epoch metrics
         """
+        # Initialize metric collectors
         policy_losses = []
         monitor_losses = []
         combined_rewards = []
         truthfulness_penalties = []
         constraint_lambdas = []
         accuracies = []
+        
+        # Additional metrics for comprehensive logging
+        reward_scores_all = []
+        judge_scores_all = []
+        policy_correctness_all = []
+        judge_correctness_all = []
+        monitor_correctness_all = []
+        parsed_answers_all = []
         
         # Set models to training mode
         self.policy_model.get_model_for_training().train()
@@ -275,41 +331,89 @@ class MinMaxTrainer:
                     break                
                 samples_processed += batch_size
             
-            try:
-                # Clear cache before each batch
-                torch.cuda.empty_cache()
+            # Clear cache before each batch
+            torch.cuda.empty_cache()
+            
+            # Forward pass through pipeline
+            minmax_output = self.pipeline.forward_pass(
+                batch, 
+                max_new_tokens=self.config.policy_model.max_new_tokens // 4
+            )
+            
+            # Parse monitor judgments for additional metrics
+            monitor_judgments = self.processor.parse_monitor_judgments_batch(minmax_output.monitor_critiques)
+            monitor_correctness = self.processor.compute_monitor_correctness_batch(
+                monitor_judgments, 
+                minmax_output.ground_truth_correct
+            )
+            
+            # TTUR: Single step handles both monitor (inner) and policy (outer) updates
+            all_metrics = self.optimizer.step(minmax_output)
+            
+            # Collect basic training metrics
+            policy_losses.append(all_metrics["policy_loss"])
+            monitor_losses.append(all_metrics["monitor_loss"])
+            combined_rewards.append(all_metrics["policy_reward"])
+            truthfulness_penalties.append(all_metrics["avg_violation"])
+            constraint_lambdas.append(all_metrics["lambda"])
+            accuracies.append(minmax_output.ground_truth_correct.float().mean().item())
+            
+            # Collect additional metrics for comprehensive analysis
+            reward_scores_all.extend(minmax_output.reward_scores.cpu().tolist())
+            judge_scores_all.extend(minmax_output.judge_scores.cpu().tolist())
+            policy_correctness_all.extend(minmax_output.ground_truth_correct.cpu().tolist())
+            parsed_answers_all.extend(minmax_output.parsed_answers)
+            
+            # Judge correctness: binary threshold on judge scores
+            judge_binary = (minmax_output.judge_scores > 0.5).float()
+            judge_correctness_batch = (judge_binary == minmax_output.ground_truth_correct).float()
+            judge_correctness_all.extend(judge_correctness_batch.cpu().tolist())
+            
+            # Monitor correctness
+            monitor_correctness_all.extend(monitor_correctness.cpu().tolist())
+            
+            # Log comprehensive metrics to wandb every log_frequency batches
+            if self.metrics_logger and batch_idx % self.config.evaluation.log_frequency == 0:
+                # Compute batch-level metrics
+                batch_metrics = {
+                    'policy_loss': all_metrics["policy_loss"],
+                    'monitor_loss': all_metrics["monitor_loss"],
+                    'combined_reward': all_metrics["policy_reward"],
+                    'truthfulness_penalty': all_metrics["avg_violation"],
+                    'lambda': all_metrics["lambda"],
+                    'policy_accuracy': minmax_output.ground_truth_correct.float().mean().item(),
+                    'reward_score_mean': minmax_output.reward_scores.mean().item(),
+                    'judge_score_mean': minmax_output.judge_scores.mean().item(),
+                }
                 
-                # Forward pass through pipeline
-                minmax_output = self.pipeline.forward_pass(
-                    batch, 
-                    max_new_tokens=self.config.policy_model.max_new_tokens // 4
+                # Compute deception metrics for judge
+                judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
+                    minmax_output.judge_scores, minmax_output.ground_truth_correct
                 )
+                for key, value in judge_deception_metrics.items():
+                    batch_metrics[f'judge_{key}'] = value
                 
-                # TTUR: Single step handles both monitor (inner) and policy (outer) updates
-                # Monitor updated more frequently than policy automatically
-                all_metrics = self.optimizer.step(minmax_output)
+                # Compute deception metrics for monitor
+                monitor_deception_metrics = self.metrics_logger.compute_deception_metrics(
+                    monitor_correctness, minmax_output.ground_truth_correct
+                )
+                for key, value in monitor_deception_metrics.items():
+                    batch_metrics[f'monitor_{key}'] = value
                 
-                # Extract metrics for logging
-                policy_losses.append(all_metrics["policy_loss"])
-                monitor_losses.append(all_metrics["monitor_loss"])
-                combined_rewards.append(all_metrics["policy_reward"])
-                truthfulness_penalties.append(all_metrics["avg_violation"])
-                constraint_lambdas.append(all_metrics["lambda"])
-                accuracies.append(minmax_output.ground_truth_correct.float().mean().item())
-                
-                # Log progress
-                if batch_idx % self.config.evaluation.log_frequency == 0:
-                    logger.info(f"Batch {batch_idx}: "
-                              f"Combined_Reward={combined_rewards[-1]:.3f}, "
-                              f"Policy_Loss={policy_losses[-1]:.3f}, "
-                              f"Monitor_Loss={monitor_losses[-1]:.3f}, "
-                              f"Accuracy={accuracies[-1]:.3f}, "
-                              f"λ={constraint_lambdas[-1]:.3f}")
-                
-            except Exception as e:
-                logger.error(f"Error in batch {batch_idx}: {e}")
-                continue
-        
+                # Log batch metrics
+                self.metrics_logger.log_training_batch_metrics(batch_metrics)
+            
+            self.metrics_logger.global_train_step += 1
+            
+            # Log progress
+            if batch_idx % self.config.evaluation.log_frequency == 0:
+                logger.info(f"Batch {batch_idx}: "
+                            f"Combined_Reward={combined_rewards[-1]:.3f}, "
+                            f"Policy_Loss={policy_losses[-1]:.3f}, "
+                            f"Monitor_Loss={monitor_losses[-1]:.3f}, "
+                            f"Accuracy={accuracies[-1]:.3f}, "
+                            f"λ={constraint_lambdas[-1]:.3f}")
+                        
         return {
             "mean_policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
             "mean_monitor_loss": float(np.mean(monitor_losses)) if monitor_losses else 0.0,
@@ -320,14 +424,22 @@ class MinMaxTrainer:
         }
     
     def evaluate(self) -> Dict[str, Any]:
-        """Evaluate the MinMax models"""
+        """Evaluate the MinMax models with comprehensive metrics collection"""
         logger.info("Running MinMax evaluation...")
         
         # Set models to evaluation mode
         self.policy_model.get_model_for_training().eval()
         self.monitor_model.get_model_for_training().eval()
         
-        all_metrics = []
+        # Collect comprehensive evaluation data
+        all_policy_correctness = []
+        all_judge_scores = []
+        all_monitor_correctness = []
+        all_reward_scores = []
+        all_combined_scores = []
+        all_truthfulness_penalties = []
+        all_parsed_answers = []
+        batch_metrics_list = []
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dataloader):
@@ -336,13 +448,42 @@ class MinMaxTrainer:
                     break
                 
                 try:
-                    # Evaluate batch
-                    batch_metrics = self.pipeline.evaluate_batch(
+                    # Forward pass for evaluation (no training updates)
+                    minmax_output = self.pipeline.forward_pass(
                         batch, 
                         max_new_tokens=self.config.policy_model.max_new_tokens // 4
                     )
-                    all_metrics.append(batch_metrics)
-                    logger.info("Batch %d evaluation metrics: \n%s", batch_idx, json.dumps(batch_metrics, indent=2))
+                    
+                    # Parse monitor judgments
+                    monitor_judgments = self.processor.parse_monitor_judgments_batch(minmax_output.monitor_critiques)
+                    monitor_correctness = self.processor.compute_monitor_correctness_batch(
+                        monitor_judgments, 
+                        minmax_output.ground_truth_correct
+                    )
+                    
+                    # Collect data for comprehensive analysis
+                    all_policy_correctness.extend(minmax_output.ground_truth_correct.cpu().tolist())
+                    all_judge_scores.extend(minmax_output.judge_scores.cpu().tolist())
+                    all_monitor_correctness.extend(monitor_correctness.cpu().tolist())
+                    all_reward_scores.extend(minmax_output.reward_scores.cpu().tolist())
+                    all_combined_scores.extend(minmax_output.combined_scores.cpu().tolist())
+                    all_truthfulness_penalties.extend(minmax_output.truthfulness_penalty.cpu().tolist())
+                    all_parsed_answers.extend(minmax_output.parsed_answers)
+                    
+                    # Compute batch-level metrics for logging
+                    batch_metrics = {
+                        "accuracy": minmax_output.ground_truth_correct.float().mean().item(),
+                        "avg_reward_score": minmax_output.reward_scores.mean().item(),
+                        "avg_judge_score": minmax_output.judge_scores.mean().item(),
+                        "avg_combined_score": minmax_output.combined_scores.mean().item(),
+                        "avg_truthfulness_penalty": minmax_output.truthfulness_penalty.mean().item(),
+                        "avg_critique_length": np.mean([len(critique.split()) for critique in minmax_output.monitor_critiques]),
+                        "parsing_success_rate": np.mean([1.0 if ans in ['A', 'B'] else 0.0 for ans in minmax_output.parsed_answers]),
+                        "batch_size": len(minmax_output.parsed_answers),
+                    }
+                    batch_metrics_list.append(batch_metrics)
+                    
+                    logger.debug("Batch %d evaluation metrics: \n%s", batch_idx, json.dumps(batch_metrics, indent=2))
                     
                 except Exception as e:
                     logger.error(f"Error in eval batch {batch_idx}: {e}")
@@ -350,21 +491,45 @@ class MinMaxTrainer:
                     traceback.print_exc()
                     continue
         
-        # Aggregate metrics
-        if not all_metrics:
+        # Aggregate basic metrics
+        if not batch_metrics_list:
             return {"error": "No successful evaluation batches"}
         
+        # Convert to tensors for metrics computation
+        policy_correctness_tensor = torch.tensor(all_policy_correctness, dtype=torch.float32)
+        judge_scores_tensor = torch.tensor(all_judge_scores, dtype=torch.float32)
+        monitor_correctness_tensor = torch.tensor(all_monitor_correctness, dtype=torch.float32)
+        
+        # Compute comprehensive metrics using MetricsLogger
         aggregated_metrics = {
-            "accuracy": np.mean([m["accuracy"] for m in all_metrics]),
-            "avg_reward_score": np.mean([m["avg_reward_score"] for m in all_metrics]),
-            "avg_judge_score": np.mean([m["avg_judge_score"] for m in all_metrics]),
-            "avg_combined_score": np.mean([m["avg_combined_score"] for m in all_metrics]),
-            "avg_truthfulness_penalty": np.mean([m["avg_truthfulness_penalty"] for m in all_metrics]),
-            "avg_critique_length": np.mean([m["avg_critique_length"] for m in all_metrics]),
-            "parsing_success_rate": np.mean([m["parsing_success_rate"] for m in all_metrics]),
-            "judge_accuracy": np.mean([m["judge_accuracy"] for m in all_metrics]),
-            "total_samples": sum([m["batch_size"] for m in all_metrics]),
+            "accuracy": float(policy_correctness_tensor.mean().item()),
+            "avg_reward_score": float(np.mean(all_reward_scores)),
+            "avg_judge_score": float(np.mean(all_judge_scores)),
+            "avg_combined_score": float(np.mean(all_combined_scores)),
+            "avg_truthfulness_penalty": float(np.mean(all_truthfulness_penalties)),
+            "avg_critique_length": np.mean([m["avg_critique_length"] for m in batch_metrics_list]),
+            "parsing_success_rate": np.mean([m["parsing_success_rate"] for m in batch_metrics_list]),
+            "total_samples": sum([m["batch_size"] for m in batch_metrics_list]),
         }
+        
+        # Add judge deception metrics
+        if self.metrics_logger:
+            judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
+                judge_scores_tensor, policy_correctness_tensor
+            )
+            for key, value in judge_deception_metrics.items():
+                aggregated_metrics[f"judge_{key}"] = value
+            
+            # Add monitor deception metrics
+            monitor_deception_metrics = self.metrics_logger.compute_deception_metrics(
+                monitor_correctness_tensor, policy_correctness_tensor
+            )
+            for key, value in monitor_deception_metrics.items():
+                aggregated_metrics[f"monitor_{key}"] = value
+            
+            # Add answer distribution
+            answer_distribution = self.metrics_logger.compute_answer_distribution(all_parsed_answers)
+            aggregated_metrics.update(answer_distribution)
         
         return aggregated_metrics
     
