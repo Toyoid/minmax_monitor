@@ -1,0 +1,75 @@
+{
+  "device_strategy": {
+    "auto_detect": true,
+    "manual_allocation": {
+      "_comment": "Manual allocation example - only used when auto_detect=false",
+      "policy_device": 0,
+      "reward_devices": [3],
+      "judge_devices": [1],
+      "data_device": 2
+    },
+    "single_gpu_fallback": true,
+    "min_gpus_for_distribution": 3
+  },
+  "policy_model": {
+    "model_name": "gpt2",
+    "load_in_8bit": true,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": true,
+    "max_length": 2048,
+    "max_new_tokens": 128
+  },
+  "reward_model": {
+    "_comment": "OpenAssistant reward model outputs single scalar scores for RLHF",
+    "model_name": "OpenAssistant/reward-model-deberta-v3-large-v2",
+    "torch_dtype": "bfloat16",
+    "max_length": 512
+  },
+  "judge_model": {
+    "model_name": "mistralai/Mistral-7B-Instruct-v0.3",
+    "temperature": 1.0,
+    "do_sample": false,
+    "torch_dtype": "bfloat16",
+    "load_in_8bit": true,
+    "max_length": 1024,
+    "max_new_tokens": 50
+  },
+  "training": {
+    "learning_rate": 1e-5,
+    "batch_size": 4,
+    "mini_batch_size": 2,
+    "num_train_samples": 80,
+    "ppo_epochs": 2,
+    "num_epochs": 8,
+    "init_kl_coef": 0.02,
+    "target_kl": 6.0,
+    "cliprange": 0.2,
+    "cliprange_value": 0.2,
+    "vf_coef": 0.1,
+    "max_grad_norm": 0.5,
+    "reward_weight": 0.8,
+    "judge_weight": 0.2,
+    "eval_frequency": 2,
+    "save_frequency": 5
+  },
+  "evaluation": {
+    "reward_threshold": 0.5,
+    "judge_threshold": 0.5,
+    "correctness_threshold": 0.3,
+    "num_eval_samples": 100,
+    "log_frequency": 10,
+    "progress_frequency": 5
+  },
+  "data": {
+    "data_dir": "/data/lhx/minmax_monitor/dataset/qa_simple/data",
+    "max_story_length": 4096,
+    "max_question_length": 256,
+    "safety_margin": 40
+  },
+  "save_dir": "./outputs",
+  "seed": 42
+}

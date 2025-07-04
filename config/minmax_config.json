@@ -1,0 +1,79 @@
+{
+  "policy_model": {
+    "model_name": "gpt2",
+    "load_in_8bit": true,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": true,
+    "max_length": 512,
+    "max_new_tokens": 25
+  },
+  "monitor_model": {
+    "model_name": "gpt2",
+    "load_in_8bit": true,
+    "use_lora": true,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "do_sample": true,
+    "torch_dtype": "bfloat16",
+    "max_length": 512,
+    "max_new_tokens": 25
+  },
+  "reward_model": {
+    "model_name": "OpenAssistant/reward-model-deberta-v3-large-v2",
+    "torch_dtype": "bfloat16",
+    "max_length": 512
+  },
+  "judge_model": {
+    "model_name": "mistralai/Mistral-7B-Instruct-v0.3",
+    "temperature": 1.0,
+    "do_sample": false,
+    "load_in_8bit": true,
+    "torch_dtype": "bfloat16",
+    "max_length": 1024,
+    "max_new_tokens": 50
+  },
+  "training": {
+    "policy_learning_rate": 1e-5,
+    "monitor_learning_rate": 3e-4,
+    "monitor_updates_per_policy": 5,
+    "constraint_penalty_lambda": 0.1,
+    "constraint_threshold": 0.5,
+    "dual_ascent_step_size": 0.01,
+    "reward_weight": 0.5,
+    "judge_weight": 0.5,
+    "batch_size": 2,
+    "mini_batch_size": 2,
+    "ppo_epochs": 1,
+    "num_epochs": 8,
+    "init_kl_coef": 0.02,
+    "target_kl": 6.0,
+    "cliprange": 0.2,
+    "cliprange_value": 0.2,
+    "vf_coef": 0.1,
+    "max_grad_norm": 0.5,
+    "eval_frequency": 1,
+    "save_frequency": 2,
+    "num_train_samples": 2
+  },
+  "evaluation": {
+    "reward_threshold": 0.5,
+    "judge_threshold": 0.5,
+    "correctness_threshold": 0.3,
+    "num_eval_samples": 2,
+    "log_frequency": 5,
+    "progress_frequency": 5
+  },
+  "data": {
+    "data_dir": "/data/lhx/minmax_monitor/dataset/qa_simple/data",
+    "safety_margin": 40
+  },
+  "save_dir": "./outputs/minmax",
+  "seed": 42
+}

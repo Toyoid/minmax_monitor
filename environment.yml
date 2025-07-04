@@ -1,0 +1,62 @@
+name: minmax-monitor
+channels:
+  - huggingface
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  # Python
+  - python=3.11
+  
+  # PyTorch and CUDA (adjust CUDA version as needed)
+  - pytorch>=2.0.0
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1  # or 12.1 depending on your GPU
+  
+  # Core ML libraries
+  - numpy
+  - scipy
+  - scikit-learn
+  - pandas
+  
+  # Hugging Face ecosystem
+  - transformers>=4.30.0
+  - datasets
+  - tokenizers
+  - peft  # Parameter-Efficient Fine-Tuning
+  
+  # Monitoring and logging
+  - wandb
+  - tensorboard
+  - tqdm
+  
+  # Development tools
+  - jupyter
+  - ipykernel
+  - matplotlib
+  - seaborn
+  
+  # Other useful libraries
+  - requests
+  - packaging
+  - pyyaml
+  - psutil
+  
+  # Pip dependencies (not available in conda)
+  - pip
+  - pip:
+    # Deep learning optimization
+    - accelerate  # For distributed training
+    - deepspeed
+    
+    # RL training libraries
+    - trl  # Transformers Reinforcement Learning
+    
+    # Additional useful packages
+    - bitsandbytes  # 8-bit optimizers
+    - flash-attn  # Flash attention (if compatible with your GPU)
+    - ninja  # For faster compilation
+    - einops  # Tensor operations
+    - safetensors  # Safe tensor serialization
