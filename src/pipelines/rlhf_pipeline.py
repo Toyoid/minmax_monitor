@@ -298,13 +298,15 @@ class RLHFPipeline:
         if not hasattr(self, '_reward_weight') or not hasattr(self, '_judge_weight'):
             raise RuntimeError("Reward weights not set. Use set_reward_weights() to configure.")
 
-        # Normalize scores to [-1, 1] range
-        # Reward scores: use tanh to map raw logits to [-1, 1]
-        normalized_reward = torch.tanh(rlhf_output.reward_scores)
-        
-        # Judge scores: already in [-1, 1] range
-        normalized_judge = rlhf_output.judge_scores
-        
+        # # Normalize scores to [-1, 1] range
+        # # Reward scores: use tanh to map raw logits to [-1, 1]
+        # normalized_reward = torch.tanh(rlhf_output.reward_scores)
+        # # Judge scores: already in [-1, 1] range
+        # normalized_judge = rlhf_output.judge_scores
+
+        normalized_reward = torch.clamp(rlhf_output.reward_scores, -15.0, 15.0)
+        normalized_judge = rlhf_output.judge_scores * 5.0
+
         # Combine rewards
         combined_reward = (self._reward_weight * normalized_reward + 
                           self._judge_weight * normalized_judge)
