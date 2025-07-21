@@ -88,36 +88,51 @@ class MinMaxTrainer:
         logger.info("MinMax trainer initialized successfully")
     
     def _setup_metrics_logger(self):
-        """Setup MetricsLogger for wandb integration"""
-        # Extract wandb config from training config if available
-        wandb_config = getattr(self.config, 'wandb', {})
+        """Setup MetricsLogger with configurable backends"""
+        # Extract logging config
+        logging_config = getattr(self.config, 'logging', {})
+        
+        # Get backends list (default to wandb for backward compatibility)
+        backends = getattr(logging_config, 'backends', ['wandb'])
+        
+        # Extract backend-specific configs
+        wandb_config = getattr(logging_config, 'wandb_config', {})
+        tensorboard_config = getattr(logging_config, 'tensorboard', {})
         
         # Create run name with timestamp
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"minmax_{self.dataset_name}_{timestamp}"
         
-        # Get project name from config or use default
-        project_name = wandb_config.get('project', 'minmax-rlhf-training')
+        # Get project name from wandb config or use default
+        project_name = wandb_config.get('project', 'minmax_rlhf')
         
-        # Initialize MetricsLogger
+        # Initialize MetricsLogger with multiple backends
         try:
             self.metrics_logger = MetricsLogger(
                 project_name=project_name,
                 run_name=run_name,
                 config=self.config.to_dict(),
                 trainer_type="minmax",
-                wandb_config=wandb_config
+                backends=backends,
+                wandb_config=wandb_config,
+                tensorboard_config=tensorboard_config
             )
-            logger.info("MetricsLogger initialized for MinMax training")
+            logger.info(f"MetricsLogger initialized for MinMax training with backends: {backends}")
         except Exception as e:
-            logger.warning(f"Failed to initialize MetricsLogger: {e}. Training will continue without wandb logging.")
+            logger.warning(f"Failed to initialize MetricsLogger: {e}. Training will continue without logging.")
             self.metrics_logger = None
     
     def _setup_dataset_config(self):
         """Setup dataset-specific configuration"""
         if self.dataset_name == "qa_simple":
-            self.dataset_config = QASimpleConfig()
+            self.dataset_config = QASimpleConfig(
+                story_truncation_strategy=self.config.data.story_truncation_strategy,
+                answer_parsing_strategy=self.config.data.answer_parsing_strategy,
+                response_extraction_strategy=self.config.data.response_extraction_strategy,
+                answer_choices_format=self.config.data.answer_choices_format,
+                num_choices=self.config.data.num_choices
+            )
             self.data_dir = self.config.data.data_dir
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
@@ -177,6 +192,13 @@ class MinMaxTrainer:
             self.judge_model,
             self.processor,
             self.device_manager
+        )
+        
+        # Configure enhanced constraint parameters
+        self.pipeline.set_constraint_config(
+            monitor_verdict_weight=self.config.training.monitor_verdict_weight,
+            monitor_reward_weight=self.config.training.monitor_reward_weight,
+            use_monitor_rewards=self.config.training.use_monitor_rewards
         )
         
         logger.info("MinMax pipeline initialized")
@@ -308,10 +330,9 @@ class MinMaxTrainer:
         
         # Additional metrics for comprehensive logging
         reward_scores_all = []
+        monitor_reward_scores_all = []
         judge_scores_all = []
         policy_correctness_all = []
-        judge_correctness_all = []
-        monitor_correctness_all = []
         parsed_answers_all = []
         
         # Set models to training mode
@@ -337,7 +358,7 @@ class MinMaxTrainer:
             # Forward pass through pipeline
             minmax_output = self.pipeline.forward_pass(
                 batch, 
-                max_new_tokens=self.config.policy_model.max_new_tokens // 4
+                max_new_tokens=self.config.policy_model.max_new_tokens
             )
             
             # Parse monitor judgments for additional metrics
@@ -360,30 +381,33 @@ class MinMaxTrainer:
             
             # Collect additional metrics for comprehensive analysis
             reward_scores_all.extend(minmax_output.reward_scores.cpu().tolist())
+            monitor_reward_scores_all.extend(minmax_output.monitor_reward_scores.cpu().tolist())
             judge_scores_all.extend(minmax_output.judge_scores.cpu().tolist())
             policy_correctness_all.extend(minmax_output.ground_truth_correct.cpu().tolist())
             parsed_answers_all.extend(minmax_output.parsed_answers)
-            
-            # Judge correctness: binary threshold on judge scores
-            judge_binary = (minmax_output.judge_scores > 0.5).float()
-            judge_correctness_batch = (judge_binary == minmax_output.ground_truth_correct).float()
-            judge_correctness_all.extend(judge_correctness_batch.cpu().tolist())
-            
-            # Monitor correctness
-            monitor_correctness_all.extend(monitor_correctness.cpu().tolist())
-            
+                        
             # Log comprehensive metrics to wandb every log_frequency batches
             if self.metrics_logger and batch_idx % self.config.evaluation.log_frequency == 0:
                 # Compute batch-level metrics
                 batch_metrics = {
+                    # metrics during backward propagation
                     'policy_loss': all_metrics["policy_loss"],
+                    'policy_kl': all_metrics["policy_kl"],
+                    'policy_entropy': all_metrics["policy_entropy"],
+                    'policy_combined_reward': all_metrics["policy_reward"],
                     'monitor_loss': all_metrics["monitor_loss"],
-                    'combined_reward': all_metrics["policy_reward"],
-                    'truthfulness_penalty': all_metrics["avg_violation"],
+                    'monitor_kl': all_metrics["monitor_kl"],
+                    'monitor_entropy': all_metrics["monitor_entropy"],
+                    'monitor_train_reward': all_metrics["monitor_reward"],
                     'lambda': all_metrics["lambda"],
+                    'truthfulness_penalty': all_metrics["avg_violation"],
+                    'monitor_verdict_penalty': minmax_output.monitor_verdict_penalty.item(),
+                    'monitor_reward_penalty': minmax_output.monitor_reward_penalty.item(),
+                    # metrics during forward pass
                     'policy_accuracy': minmax_output.ground_truth_correct.float().mean().item(),
-                    'reward_score_mean': minmax_output.reward_scores.mean().item(),
-                    'judge_score_mean': minmax_output.judge_scores.mean().item(),
+                    'policy_reward_score': minmax_output.reward_scores.mean().item(),
+                    'monitor_reward_score': minmax_output.monitor_reward_scores.mean().item(),
+                    'judge_score': minmax_output.judge_scores.mean().item(),
                 }
                 
                 # Compute deception metrics for judge
@@ -436,6 +460,7 @@ class MinMaxTrainer:
         all_judge_scores = []
         all_monitor_correctness = []
         all_reward_scores = []
+        all_monitor_reward_scores = []
         all_combined_scores = []
         all_truthfulness_penalties = []
         all_parsed_answers = []
@@ -451,7 +476,7 @@ class MinMaxTrainer:
                     # Forward pass for evaluation (no training updates)
                     minmax_output = self.pipeline.forward_pass(
                         batch, 
-                        max_new_tokens=self.config.policy_model.max_new_tokens // 4
+                        max_new_tokens=self.config.policy_model.max_new_tokens
                     )
                     
                     # Parse monitor judgments
@@ -466,6 +491,7 @@ class MinMaxTrainer:
                     all_judge_scores.extend(minmax_output.judge_scores.cpu().tolist())
                     all_monitor_correctness.extend(monitor_correctness.cpu().tolist())
                     all_reward_scores.extend(minmax_output.reward_scores.cpu().tolist())
+                    all_monitor_reward_scores.extend(minmax_output.monitor_reward_scores.cpu().tolist())
                     all_combined_scores.extend(minmax_output.combined_scores.cpu().tolist())
                     all_truthfulness_penalties.extend(minmax_output.truthfulness_penalty.cpu().tolist())
                     all_parsed_answers.extend(minmax_output.parsed_answers)
@@ -474,9 +500,12 @@ class MinMaxTrainer:
                     batch_metrics = {
                         "accuracy": minmax_output.ground_truth_correct.float().mean().item(),
                         "avg_reward_score": minmax_output.reward_scores.mean().item(),
+                        "avg_monitor_reward_score": minmax_output.monitor_reward_scores.mean().item(),
                         "avg_judge_score": minmax_output.judge_scores.mean().item(),
                         "avg_combined_score": minmax_output.combined_scores.mean().item(),
                         "avg_truthfulness_penalty": minmax_output.truthfulness_penalty.mean().item(),
+                        "monitor_verdict_penalty": minmax_output.monitor_verdict_penalty.item(),
+                        "monitor_reward_penalty": minmax_output.monitor_reward_penalty.item(),
                         "avg_critique_length": np.mean([len(critique.split()) for critique in minmax_output.monitor_critiques]),
                         "parsing_success_rate": np.mean([1.0 if ans in ['A', 'B'] else 0.0 for ans in minmax_output.parsed_answers]),
                         "batch_size": len(minmax_output.parsed_answers),
@@ -504,6 +533,7 @@ class MinMaxTrainer:
         aggregated_metrics = {
             "accuracy": float(policy_correctness_tensor.mean().item()),
             "avg_reward_score": float(np.mean(all_reward_scores)),
+            "avg_monitor_reward_score": float(np.mean(all_monitor_reward_scores)),
             "avg_judge_score": float(np.mean(all_judge_scores)),
             "avg_combined_score": float(np.mean(all_combined_scores)),
             "avg_truthfulness_penalty": float(np.mean(all_truthfulness_penalties)),
@@ -514,6 +544,7 @@ class MinMaxTrainer:
         
         # Add judge deception metrics
         if self.metrics_logger:
+            print("Judge Model: ")
             judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
                 judge_scores_tensor, policy_correctness_tensor
             )
@@ -521,6 +552,7 @@ class MinMaxTrainer:
                 aggregated_metrics[f"judge_{key}"] = value
             
             # Add monitor deception metrics
+            print("Monitor Model: ")
             monitor_deception_metrics = self.metrics_logger.compute_deception_metrics(
                 monitor_correctness_tensor, policy_correctness_tensor
             )
@@ -530,6 +562,9 @@ class MinMaxTrainer:
             # Add answer distribution
             answer_distribution = self.metrics_logger.compute_answer_distribution(all_parsed_answers)
             aggregated_metrics.update(answer_distribution)
+
+            # Log evaluation metrics
+            self.metrics_logger.log_evaluation_metrics(aggregated_metrics)
         
         return aggregated_metrics
     
@@ -560,8 +595,8 @@ class MinMaxTrainer:
 def main():
     parser = argparse.ArgumentParser(description="MinMax LLM-vs-Monitor Training")
     parser.add_argument("--config", type=str, 
-                       default="/data/lhx/minmax_monitor/config/minmax_config.json",
-                       help="Path to configuration file")
+                       default="config/minmax_config.json",
+                       help="Path to configuration file (relative to project root)")
     parser.add_argument("--dataset", type=str, default="qa_simple",
                        choices=["qa_simple"],
                        help="Dataset to use for training")
@@ -586,6 +621,9 @@ def main():
         results = {k: (v.item() if hasattr(v, "item") else v)
                   for k, v in results.items()}
         print(json.dumps(results, indent=2))
+        # save evaluation results
+        with open(os.path.join(trainer.save_dir, "evaluation_results.json"), 'w') as f:
+            json.dump(results, f, indent=2)
     else:
         training_stats = trainer.train(num_epochs=args.epochs)
         print("MinMax training completed!")

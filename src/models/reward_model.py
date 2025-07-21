@@ -1,7 +1,6 @@
 """
 Reward Model: Dataset-Agnostic Model for RLHF reward scoring
-Designed for OpenAssistant reward model (single scalar output)
-Supports multi-device inference for better performance
+Supports multiple reward model types via plugin architecture
 """
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -38,6 +37,11 @@ class RewardModel:
         try:
             logger.info(f"Loading reward model on {self.device}")
             
+            # Get plugin for this model type
+            from .reward_plugins import get_plugin
+            self.plugin = get_plugin(self.model_name)
+            logger.info(f"Using plugin for model type: {type(self.plugin).__name__}")
+            
             # Load tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
@@ -53,12 +57,18 @@ class RewardModel:
                 device_map = {"": self.device}
                 torch_dtype = torch.bfloat16
             
+            # Get plugin-specific model kwargs
+            model_kwargs = {
+                "torch_dtype": torch_dtype,
+                "device_map": device_map,
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": True,
+                **self.plugin.get_model_kwargs()  # Plugin-specific parameters
+            }
+            
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 self.model_name,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
+                **model_kwargs
             )
             self.model.eval()
             
@@ -72,33 +82,47 @@ class RewardModel:
         """Get the device this model is loaded on"""
         return self.device
         
-    def score_batch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def score_batch(self, conversations: List[List[Dict]]) -> torch.Tensor:
         """
-        Dataset-agnostic batch scoring - Single Device Mode
-        Designed for OpenAssistant reward model which outputs single scalar scores
+        Score batch of conversations using plugin-based processing
         
         Args:
-            input_ids: Tokenized input sequences [batch_size, seq_len]
-            attention_mask: Attention mask [batch_size, seq_len]
+            conversations: List of conversation dictionaries with 'role' and 'content' keys
             
         Returns:
-            Raw reward scores [batch_size] (unormalized logits)
+            Reward scores [batch_size] (processed by plugin)
         """
         try:
-            # Move inputs to model device
-            input_ids = input_ids.to(self.device)
-            attention_mask = attention_mask.to(self.device)
+            # Use plugin to preprocess conversations
+            formatted_texts = self.plugin.preprocess_conversations(conversations, self.tokenizer)
+
+            # # print the formatted texts for debugging
+            # print("\n======================================================")
+            # for i, text in enumerate(formatted_texts):
+            #     logger.debug(f"Reward Model Formatted Input Text {i}: \n{text}")
+            # print("======================================================\n")
             
+            # Tokenize the formatted texts
+            inputs = self.tokenizer(
+                formatted_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length
+            ).to(self.device)
+            
+            # Get scores from model
             with torch.no_grad():
-                outputs = self.model(input_ids, attention_mask)
-                # OpenAssistant reward model outputs single scalar scores
-                # logits shape: [batch_size, 1] or [batch_size]
-                scores = outputs.logits.squeeze(-1)  # Remove last dimension if it's 1
-                return scores.float().cpu()  # Return on CPU for consistency
+                outputs = self.model(**inputs)
+                raw_scores = outputs.logits
+            
+            # Use plugin to postprocess scores
+            processed_scores = self.plugin.postprocess_scores(raw_scores)
+            return processed_scores.float().cpu()  # Return on CPU for consistency
                 
         except Exception as e:
             logger.error(f"Error during reward model batch scoring on {self.device}: {e}")
-            batch_size = input_ids.size(0)
+            batch_size = len(conversations)
             return torch.zeros(batch_size, dtype=torch.float32)
     
     def get_model(self):

@@ -5,7 +5,6 @@ Orchestrates the entire RLHF forward pass with policy, reward, and judge models
 import torch
 import logging
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
 
 from ..data.dataset_processor import (
     DatasetProcessor, RawBatchData, PolicyOutput, RLHFBatch
@@ -68,7 +67,7 @@ class RLHFPipeline:
         policy_prompts = self.processor.create_policy_prompts_batch(
             batch_data.stories, batch_data.questions, batch_data.answer_choices
         )
-        
+
         policy_inputs = self.processor.tokenize_policy_batch(policy_prompts)
         
         generated_tokens = self.policy_model.generate_batch(
@@ -83,33 +82,28 @@ class RLHFPipeline:
             generated_tokens, policy_inputs['input_lengths']
         )
         parsed_answers = self.processor.parse_answers_batch(responses, batch_data.answer_choices)
-        # justifications = self.processor.extract_justifications_batch(responses)
-        justifications = responses  # For now, just use responses as justifications
         
         print("Parsed responses:")
         print(60 * "=")
         for i, response in enumerate(responses):
             print(f"Response {i+1}: ")
             print(f"Parsed answer: {parsed_answers[i]}")
-            print(f"Justification: {justifications[i]}")
+            print(f"Justification: {responses[i]}")
             print(60 * "=")
 
         # Create policy output object
         policy_output = PolicyOutput(
             generated_ids=generated_tokens,
             parsed_answers=parsed_answers,
-            justifications=justifications,
+            justifications=responses,
         )
         
         # 3. Reward evaluation
         logger.debug("Step 3: Reward model evaluation")
-        reward_prompts = self.processor.create_reward_inputs_batch(
-            batch_data.questions, batch_data.answer_choices, parsed_answers, justifications
+        reward_conversations = self.processor.create_reward_inputs_batch(
+            batch_data.questions, batch_data.answer_choices, parsed_answers, responses
         )
-        reward_inputs = self.processor.tokenize_reward_batch(reward_prompts)
-        reward_scores = self.reward_model.score_batch(
-            reward_inputs['input_ids'], reward_inputs['attention_mask']
-        )
+        reward_scores = self.reward_model.score_batch(reward_conversations)
         print("Reward scores:")
         print(60 * "=")
         print(reward_scores)
@@ -118,7 +112,7 @@ class RLHFPipeline:
         # 4. Judge evaluation  
         logger.debug("Step 4: Judge model evaluation")
         judge_prompts = self.processor.create_judge_inputs_batch(
-            batch_data.questions, batch_data.answer_choices, parsed_answers, justifications
+            batch_data.questions, batch_data.answer_choices, parsed_answers, responses
         )
         judge_inputs = self.processor.tokenize_judge_batch(judge_prompts)
         judge_scores = self.judge_model.judge_batch(
@@ -134,20 +128,17 @@ class RLHFPipeline:
         ground_truth_correct = self.processor.compute_correctness_batch(
             parsed_answers, batch_data.correct_answer_ids
         )
-        
-        # 6. Synchronize all tensors to policy device for PPO training
-        if self.device_manager:
-            logger.debug("Step 6: Synchronizing tensors to policy device")
-            reward_scores = self.device_manager.move_to_policy_device(reward_scores)
-            judge_scores = self.device_manager.move_to_policy_device(judge_scores) 
-            ground_truth_correct = self.device_manager.move_to_policy_device(ground_truth_correct)
-            # Note: generated_tokens should already be on policy device
+
+        print("Ground truth correctness:")
+        print(60 * "=")
+        print(ground_truth_correct)
+        print(60 * "=")
         
         # Create final RLHF batch
         rlhf_batch = RLHFBatch(
             generated_tokens=generated_tokens,
             parsed_answers=parsed_answers,
-            justifications=justifications,
+            justifications=responses,
             reward_scores=reward_scores,
             judge_scores=judge_scores,
             ground_truth_correct=ground_truth_correct,
@@ -304,14 +295,9 @@ class RLHFPipeline:
         Returns:
             Combined reward tensor
         """
-        # Import here to avoid circular imports
-        from ..train.rlhf_trainer import RLHFTrainer
-        
-        # Get weights from the trainer's config if available
-        # For now, use default values - this will be passed from trainer
-        reward_weight = getattr(self, '_reward_weight', 0.8)
-        judge_weight = getattr(self, '_judge_weight', 0.2)
-        
+        if not hasattr(self, '_reward_weight') or not hasattr(self, '_judge_weight'):
+            raise RuntimeError("Reward weights not set. Use set_reward_weights() to configure.")
+
         # Normalize scores to [-1, 1] range
         # Reward scores: use tanh to map raw logits to [-1, 1]
         normalized_reward = torch.tanh(rlhf_output.reward_scores)
@@ -320,8 +306,8 @@ class RLHFPipeline:
         normalized_judge = rlhf_output.judge_scores
         
         # Combine rewards
-        combined_reward = (reward_weight * normalized_reward + 
-                          judge_weight * normalized_judge)
+        combined_reward = (self._reward_weight * normalized_reward + 
+                          self._judge_weight * normalized_judge)
         
         return combined_reward
     

@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 import logging
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
 
 from ..data.dataset_processor import (
     DatasetProcessor, RawBatchData, MinMaxOutput
@@ -56,6 +55,21 @@ class MinMaxPipeline:
         
         logger.info("MinMax Pipeline initialized with all models")
         
+    def set_constraint_config(self, monitor_verdict_weight: float = 0.7, 
+                            monitor_reward_weight: float = 0.3, 
+                            use_monitor_rewards: bool = True):
+        """Set enhanced constraint configuration parameters"""
+        self.monitor_verdict_weight = monitor_verdict_weight
+        self.monitor_reward_weight = monitor_reward_weight 
+        self.use_monitor_rewards = use_monitor_rewards
+        
+        # Ensure α + β = 1.0
+        total_weight = monitor_verdict_weight + monitor_reward_weight
+        if abs(total_weight - 1.0) > 1e-6:
+            logger.warning(f"Constraint weights don't sum to 1.0: α={monitor_verdict_weight}, β={monitor_reward_weight}, sum={total_weight}")
+        
+        logger.info(f"Constraint config set: α={monitor_verdict_weight}, β={monitor_reward_weight}, use_monitor_rewards={use_monitor_rewards}")
+        
     def forward_pass(self, batch_data: RawBatchData, max_new_tokens: Optional[int] = None) -> MinMaxOutput:
         """
         Complete forward pass through all models for minmax training
@@ -69,56 +83,66 @@ class MinMaxPipeline:
         """
         logger.debug(f"Starting MinMax forward pass for batch size: {len(batch_data.stories)}")
         
+        # # For debugging, log the first story
+        # for i, story in enumerate(batch_data.stories):
+        #     if i == 0:
+        #         logger.debug(f"Sample truncated story 0 of batch:\n {story}")
+
         try:
             # 1. Policy generation: S → O
             logger.debug("Step 1: Policy model generation")
             policy_outputs = self._generate_policy_responses(batch_data, max_new_tokens)
-            logger.debug(f"Policy outputs generated: {len(policy_outputs['parsed_answers'])} answers")
             
             # 2. Monitor generation: (S, O) → O'
             logger.debug("Step 2: Monitor critique generation")
             monitor_critiques = self._generate_monitor_critiques(batch_data, policy_outputs)
-            logger.debug(f"Monitor critiques generated: {len(monitor_critiques['critiques'])} critiques")
-            
-            # Log first critique for debugging
-            if monitor_critiques['critiques']:
-                logger.debug(f"Sample monitor critique: {monitor_critiques['critiques'][0][:200]}...")
             
             # 3. Reward evaluation: O → reward_scores
             logger.debug("Step 3: Reward model evaluation")
             reward_scores = self._evaluate_reward(batch_data, policy_outputs)
-            logger.debug(f"Reward scores shape: {reward_scores.shape}")
+            logger.debug(f"Reward scores tensor: {reward_scores}")
             
             # 4. Judge evaluation: (O, O') → judge_scores
             logger.debug("Step 4: Judge model evaluation with critiques")
             judge_scores = self._evaluate_judge_with_critiques(batch_data, policy_outputs, monitor_critiques['critiques'])
-            logger.debug(f"Judge scores shape: {judge_scores.shape}")
+            logger.debug(f"Judge scores tensor: {judge_scores}")
+            
+            # 4.5. Monitor reward evaluation: O' → monitor_reward_scores  
+            logger.debug("Step 4.5: Monitor reward model evaluation")
+            monitor_reward_scores = self._evaluate_monitor_reward(
+                batch_data, 
+                monitor_critiques['critiques'], 
+                policy_outputs['justifications']  # Pass policy justifications for differentiated template
+            )
+            logger.debug(f"Monitor reward scores tensor: {monitor_reward_scores}")
             
             # 5. Combined reward: R(O,O')
             logger.debug("Step 5: Computing combined reward")
             combined_scores = self._compute_combined_reward(reward_scores, judge_scores)
-            logger.debug(f"Combined scores shape: {combined_scores.shape}")
+            logger.debug(f"Combined scores tensor: {combined_scores}")
             
             # 6. Truthfulness constraint: F(π_M)
             logger.debug("Step 6: Computing truthfulness constraint")
             ground_truth_correct = self.processor.compute_correctness_batch(
                 policy_outputs['parsed_answers'], batch_data.correct_answer_ids
             )
-            logger.debug(f"Ground truth shape: {ground_truth_correct.shape}")
+            logger.debug(f"Ground truth tensor: {ground_truth_correct}")
             
-            truthfulness_penalty = self._compute_truthfulness_constraint(
-                monitor_critiques['critiques'], ground_truth_correct
+            constraint_result = self._compute_truthfulness_constraint(
+                monitor_critiques['critiques'], 
+                ground_truth_correct, 
+                monitor_reward_scores,
+                monitor_verdict_weight=getattr(self, 'monitor_verdict_weight', 0.7),
+                monitor_reward_weight=getattr(self, 'monitor_reward_weight', 0.3),
+                use_monitor_rewards=getattr(self, 'use_monitor_rewards', True)
             )
+            truthfulness_penalty = constraint_result['truthfulness_penalty']
+            monitor_verdict_penalty = constraint_result['monitor_verdict_penalty']
+            monitor_reward_penalty = constraint_result['monitor_reward_penalty']
             logger.debug(f"Truthfulness penalty shape: {truthfulness_penalty.shape}")
+            logger.debug(f"Monitor verdict penalty: {monitor_verdict_penalty.item():.4f}")
+            logger.debug(f"Monitor reward penalty: {monitor_reward_penalty.item():.4f}")
             logger.debug(f"Truthfulness penalty mean: {truthfulness_penalty.mean().item():.4f}")
-            
-            # Log constraint analysis for first few samples
-            if len(monitor_critiques['critiques']) > 0:
-                sample_critique = monitor_critiques['critiques'][0]
-                sample_gt = ground_truth_correct[0].item() if ground_truth_correct.numel() > 0 else "Unknown"
-                sample_penalty = truthfulness_penalty[0].item() if truthfulness_penalty.numel() > 0 else "Unknown"
-                logger.debug(f"Sample constraint analysis - GT: {sample_gt}, Penalty: {sample_penalty:.4f}")
-                logger.debug(f"Sample critique snippet: {sample_critique[:150]}...")
             
             # Create MinMaxOutput (tensors stay on their native devices)
             minmax_output = MinMaxOutput(
@@ -131,6 +155,9 @@ class MinMaxPipeline:
                 judge_scores=judge_scores,
                 combined_scores=combined_scores,
                 truthfulness_penalty=truthfulness_penalty,
+                monitor_reward_scores=monitor_reward_scores,
+                monitor_verdict_penalty=monitor_verdict_penalty,
+                monitor_reward_penalty=monitor_reward_penalty,
                 policy_input_lengths=policy_outputs['input_lengths'],
                 monitor_input_lengths=monitor_critiques['input_lengths'],
                 # Legacy fields for backward compatibility
@@ -173,12 +200,11 @@ class MinMaxPipeline:
             generated_tokens, policy_inputs['input_lengths']
         )
         parsed_answers = self.processor.parse_answers_batch(responses, batch_data.answer_choices)
-        justifications = responses  # For now, use full responses as justifications
         
         return {
             'generated_tokens': generated_tokens,
             'parsed_answers': parsed_answers,
-            'justifications': justifications,
+            'justifications': responses,
             'input_ids': policy_inputs['input_ids'],
             'attention_mask': policy_inputs['attention_mask'],
             'input_lengths': policy_inputs['input_lengths']
@@ -225,19 +251,28 @@ class MinMaxPipeline:
     
     def _evaluate_reward(self, batch_data: RawBatchData, policy_outputs: Dict[str, Any]) -> torch.Tensor:
         """Evaluate policy outputs with reward model"""
-        reward_prompts = self.processor.create_reward_inputs_batch(
+        reward_conversations = self.processor.create_reward_inputs_batch(
             batch_data.questions, 
             batch_data.answer_choices, 
             policy_outputs['parsed_answers'], 
             policy_outputs['justifications']
         )
         
-        reward_inputs = self.processor.tokenize_reward_batch(reward_prompts)
-        reward_scores = self.reward_model.score_batch(
-            reward_inputs['input_ids'], reward_inputs['attention_mask']
+        reward_scores = self.reward_model.score_batch(reward_conversations)
+        return reward_scores
+    
+    def _evaluate_monitor_reward(self, batch_data: RawBatchData, monitor_critiques: List[str], 
+                               policy_justifications: List[str]) -> torch.Tensor:
+        """Evaluate monitor critiques with reward model using differentiated template"""
+        monitor_reward_conversations = self.processor.create_monitor_reward_inputs_batch(
+            batch_data.questions,
+            batch_data.answer_choices,
+            monitor_critiques,
+            policy_justifications  # Pass policy justifications for context
         )
         
-        return reward_scores
+        monitor_reward_scores = self.reward_model.score_batch(monitor_reward_conversations)
+        return monitor_reward_scores
     
     def _evaluate_judge_with_critiques(self, batch_data: RawBatchData, 
                                      policy_outputs: Dict[str, Any],
@@ -272,13 +307,30 @@ class MinMaxPipeline:
         return combined_scores
     
     def _compute_truthfulness_constraint(self, monitor_critiques: List[str], 
-                                       ground_truth_correct: torch.Tensor) -> torch.Tensor:
+                                       ground_truth_correct: torch.Tensor,
+                                       monitor_reward_scores: torch.Tensor,
+                                       monitor_verdict_weight: float = 0.7,
+                                       monitor_reward_weight: float = 0.3,
+                                       use_monitor_rewards: bool = True) -> Dict[str, torch.Tensor]:
         """
-        Compute truthfulness constraint F(π_M) using Ground Truth Alignment
-        Monitor should critique wrong answers more harshly than correct ones
+        Compute enhanced truthfulness constraint F(π_M) = α * monitor_verdict_penalty + β * monitor_reward_penalty
+        
+        Args:
+            monitor_critiques: List of monitor critique texts
+            ground_truth_correct: Ground truth correctness tensor [batch_size]
+            monitor_reward_scores: Reward scores for monitor critiques [batch_size]
+            monitor_verdict_weight: Weight α for monitor verdict penalty (default: 0.7)
+            monitor_reward_weight: Weight β for monitor reward penalty (default: 0.3)
+            use_monitor_rewards: Whether to use monitor rewards in constraint (default: True)
+        
+        Returns:
+            Dictionary containing:
+            - truthfulness_penalty: Combined penalty F(π_M) [batch_size]
+            - monitor_verdict_penalty: Monitor verdict component (scalar)
+            - monitor_reward_penalty: Monitor reward component (scalar, if enabled)
         """
         try:
-            # Parse the new VERDICT/ARGUMENT format
+            # Part 1: Monitor verdict penalty (existing logic)
             critique_verdicts = []
             
             for critique in monitor_critiques:
@@ -290,47 +342,74 @@ class MinMaxPipeline:
                     verdict_start = critique_upper.find('VERDICT:') + 8
                     verdict_section = critique_upper[verdict_start:verdict_start+50]  # Look ahead 50 chars
                     
-                    if 'CORRECT' in verdict_section:
-                        verdict = 1.0  # Monitor thinks answer is correct
-                    elif 'INCORRECT' in verdict_section:
+                    if 'INCORRECT' in verdict_section:
                         verdict = 0.0  # Monitor thinks answer is incorrect  
+                    elif 'CORRECT' in verdict_section and 'INCORRECT' not in verdict_section:
+                        verdict = 1.0  # Monitor thinks answer is correct  
                     else:
-                        verdict = 0.5  # Uncertain/unclear verdict
+                        verdict = 0.2  # Uncertain/unclear verdict
                 else:
                     # Fallback to sentiment analysis if no verdict format found
                     critique_lower = critique.lower()
-                    positive_words = ['correct', 'accurate', 'good', 'right', 'valid']
+                    positive_words = ['yes', 'accurate', 'good', 'right', 'valid']
                     negative_words = ['wrong', 'incorrect', 'error', 'mistake', 'false', 'flawed']
                     
                     pos_count = sum(1 for word in positive_words if word in critique_lower)
                     neg_count = sum(1 for word in negative_words if word in critique_lower)
+                    if 'correct' in critique_lower and 'incorrect' not in critique_lower:
+                        pos_count += 1
                     
                     if pos_count > neg_count:
                         verdict = 1.0
                     elif neg_count > pos_count:
                         verdict = 0.0
                     else:
-                        verdict = 0.5
+                        verdict = 0.2
                 
                 critique_verdicts.append(verdict)
             
             monitor_verdicts = torch.tensor(critique_verdicts, dtype=torch.float32, device=ground_truth_correct.device)
             
-            # Truthfulness constraint: monitor's verdict should align with ground truth
-            # Perfect alignment = 0 penalty, complete misalignment = 4 penalty
-            constraint_violation = F.mse_loss(monitor_verdicts, ground_truth_correct)
-            constraint_violation = torch.clamp(constraint_violation * 4.0, 0.0, 4.0)
+            # Monitor verdict penalty: MSE between monitor verdicts and ground truth
+            monitor_verdict_penalty = F.mse_loss(monitor_verdicts, ground_truth_correct)
+            # monitor_verdict_penalty = torch.clamp(monitor_verdict_penalty * 4.0, 0.0, 4.0)
+            
+            result = {'monitor_verdict_penalty': monitor_verdict_penalty}
+            
+            if use_monitor_rewards:
+                # Part 2: Monitor reward penalty (new component)
+                # We want monitors to get high reward scores, so penalty = -monitor_reward
+                # Scale to [-1,1] range using tanh normalization
+                monitor_reward_penalty = -torch.tanh(monitor_reward_scores.mean())  # Penalty when rewards are low
+                # monitor_reward_penalty = torch.clamp(monitor_reward_penalty, -4.0, 4.0)
+                
+                result['monitor_reward_penalty'] = monitor_reward_penalty
+                
+                # Combined constraint: F(π_M) = α * monitor_verdict_penalty + β * monitor_reward_penalty
+                combined_penalty = (monitor_verdict_weight * monitor_verdict_penalty + 
+                                  monitor_reward_weight * monitor_reward_penalty)
+                
+                logger.debug(f"Monitor verdict penalty: {monitor_verdict_penalty:.4f}, "
+                           f"Monitor reward penalty: {monitor_reward_penalty:.4f}, "
+                           f"Combined penalty: {combined_penalty:.4f}")
+            else:
+                # Use only monitor verdict penalty (backward compatibility)
+                combined_penalty = monitor_verdict_penalty
+                result['monitor_reward_penalty'] = torch.tensor(0.0, device=ground_truth_correct.device)
+                logger.debug(f"Using only monitor verdict penalty: {combined_penalty:.4f}")
             
             # Return as a tensor with the same batch dimension as other scores
             batch_size = len(monitor_critiques)
-            return constraint_violation.expand(batch_size)
+            result['truthfulness_penalty'] = combined_penalty.expand(batch_size)
+            
+            return result
             
         except Exception as e:
             logger.error(f"Error in truthfulness constraint computation: {e}")
             logger.error(f"Monitor critiques sample: {monitor_critiques[:2] if monitor_critiques else 'None'}")
-            # Return a moderate penalty as fallback
-            batch_size = len(monitor_critiques)
-            return torch.ones(batch_size, dtype=torch.float32, device=ground_truth_correct.device) * 2.0
+            import traceback
+            traceback.print_exc()
+            raise ValueError(f"Failed to compute truthfulness constraint: {e}")
     
     def evaluate_batch(self, batch_data: RawBatchData, max_new_tokens: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -354,6 +433,7 @@ class MinMaxPipeline:
         avg_judge = minmax_output.judge_scores.mean().item()
         avg_combined = minmax_output.combined_scores.mean().item()
         avg_truthfulness_penalty = minmax_output.truthfulness_penalty.mean().item()
+        avg_monitor_reward = minmax_output.monitor_reward_scores.mean().item()
         
         # Parsing success rate
         valid_answers = sum(1 for ans in minmax_output.parsed_answers if ans != "")
@@ -374,6 +454,7 @@ class MinMaxPipeline:
             'avg_judge_score': avg_judge,
             'avg_combined_score': avg_combined,
             'avg_truthfulness_penalty': avg_truthfulness_penalty,
+            'avg_monitor_reward_score': avg_monitor_reward,
             'parsing_success_rate': parsing_success_rate,
             'judge_accuracy': judge_accuracy,
             'avg_critique_length': avg_critique_length,
@@ -381,6 +462,7 @@ class MinMaxPipeline:
             'judge_scores': minmax_output.judge_scores.cpu().numpy().tolist(),
             'combined_scores': minmax_output.combined_scores.cpu().numpy().tolist(),
             'truthfulness_penalties': minmax_output.truthfulness_penalty.cpu().numpy().tolist(),
+            'monitor_reward_scores': minmax_output.monitor_reward_scores.cpu().numpy().tolist(),
             'ground_truth_correct': minmax_output.ground_truth_correct.cpu().numpy().tolist(),
             'parsed_answers': minmax_output.parsed_answers,
             'monitor_critiques': minmax_output.monitor_critiques,

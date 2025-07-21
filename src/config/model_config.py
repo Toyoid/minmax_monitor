@@ -59,6 +59,7 @@ class MonitorModelConfig:
     device_map: str = "auto"
     temperature: float = 0.8
     top_p: Optional[float] = 0.9
+    repetition_penalty: Optional[float] = None
     do_sample: bool = True
     torch_dtype: str = "bfloat16"
     
@@ -69,6 +70,10 @@ class MonitorModelConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for RLHF Training"""
+    # Reward Combination
+    reward_weight: float = 0.5
+    judge_weight: float = 0.5
+    # PPO Parameters
     learning_rate: float = 1e-5
     batch_size: int = 16
     mini_batch_size: int = 4
@@ -76,14 +81,14 @@ class TrainingConfig:
     num_epochs: int = 8
     init_kl_coef: float = 0.02
     target_kl: float = 6.0
+    kl_penalty: str = "full"  # Full KL penalty as default
     cliprange: float = 0.2
     cliprange_value: float = 0.2
     vf_coef: float = 0.1
     max_grad_norm: float = 0.5
-    reward_weight: float = 0.8
-    judge_weight: float = 0.2
     eval_frequency: int = 2
     save_frequency: int = 5
+    num_train_samples: Optional[int] = None
 
 @dataclass
 class MinMaxTrainingConfig:
@@ -98,6 +103,11 @@ class MinMaxTrainingConfig:
     constraint_threshold: float = 0.5       # Violation threshold
     dual_ascent_step_size: float = 0.01     # λ update rate
     
+    # Enhanced Constraint Parameters (α + β = 1.0)
+    monitor_verdict_weight: float = 0.7     # α - weight for monitor verdict penalty
+    monitor_reward_weight: float = 0.3      # β - weight for monitor reward penalty
+    use_monitor_rewards: bool = True        # Whether to use monitor rewards in constraint
+    
     # Reward Combination
     reward_weight: float = 0.5
     judge_weight: float = 0.5
@@ -109,6 +119,7 @@ class MinMaxTrainingConfig:
     num_epochs: int = 8
     init_kl_coef: float = 0.02
     target_kl: float = 6.0
+    kl_penalty: str = "full"                # Full KL penalty for TTUR
     cliprange: float = 0.2
     cliprange_value: float = 0.2
     vf_coef: float = 0.1
@@ -120,9 +131,6 @@ class MinMaxTrainingConfig:
 @dataclass
 class EvaluationConfig:
     """Configuration for Deception Evaluation"""
-    reward_threshold: float = 0.5
-    judge_threshold: float = 0.5
-    correctness_threshold: float = 0.3
     num_eval_samples: int = 100
     log_frequency: int = 10
     progress_frequency: int = 5
@@ -130,13 +138,31 @@ class EvaluationConfig:
 @dataclass
 class DataConfig:
     """Configuration for Dataset and Token Management"""
-    data_dir: str = "/data/lhx/minmax_monitor/dataset/qa_simple/data"
-    max_story_length: int = 4096
-    max_question_length: int = 256
+    data_dir: str = "dataset/qa_simple/data"
     # Computed token parameters - will be synced from model configs
     reserved_generation_tokens: int = 512  # Computed from model configs
-    safety_margin: int = 40
+    safety_margin: int = 50
     max_story_tokens: Optional[int] = None  # Computed based on pipeline type
+    story_truncation_strategy: str = "intelligent",
+    answer_parsing_strategy: str = "ab_pattern", 
+    response_extraction_strategy: str = "auto",
+    answer_choices_format: str = "AB",
+    num_choices: int = 2
+
+@dataclass
+class LoggingConfig:
+    """Configuration for Logging and Metrics"""
+    backends: list = field(default_factory=lambda: ["wandb"])
+    wandb_config: Dict[str, Any] = field(default_factory=lambda: {
+        "project": "rlhf-deception-training",
+        "entity": None,
+        "tags": ["rlhf", "qa_simple"],
+        "log_frequency": 5
+    })
+    enable_console_fallback: bool = True
+    tensorboard: Dict[str, Any] = field(default_factory=lambda: {
+        "log_dir": "./tensorboard_logs"
+    })
 
 @dataclass
 class RLHFConfig:
@@ -149,6 +175,7 @@ class RLHFConfig:
     minmax_training: MinMaxTrainingConfig = field(default_factory=MinMaxTrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     save_dir: str = "./outputs"
     seed: int = 42
 
@@ -160,35 +187,6 @@ class RLHFConfig:
         """Sync token parameters from model configs to data config"""
         # For RLHF training, use policy's max_new_tokens as reserved_generation_tokens
         self.data.reserved_generation_tokens = self.policy_model.max_new_tokens
-
-    def compute_max_story_tokens(self, pipeline_type: str = "rlhf", 
-                               template_overhead: int = 200) -> int:
-        """
-        Compute max_story_tokens based on pipeline type and model constraints
-        
-        Args:
-            pipeline_type: "minmax" or "rlhf"
-            template_overhead: Tokens used by prompt template (excluding story)
-            
-        Returns:
-            Maximum tokens available for story content
-        """
-        if pipeline_type == "rlhf":
-            # For RLHF: policy prompt only needs story + question + choices + template
-            available_tokens = (self.policy_model.max_length - 
-                              template_overhead - 
-                              self.policy_model.max_new_tokens - 
-                              self.data.safety_margin)
-        else:  # MinMax mode for RLHFConfig (if monitor is available)
-            # For MinMax: monitor prompt includes policy generation
-            available_tokens = (self.monitor_model.max_length - 
-                              template_overhead - 
-                              self.policy_model.max_new_tokens -  # Policy generation in monitor input
-                              self.monitor_model.max_new_tokens - # Monitor generation
-                              self.data.safety_margin)
-        
-        self.data.max_story_tokens = max(available_tokens, 100)  # Minimum 100 tokens
-        return self.data.max_story_tokens
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'RLHFConfig':
@@ -242,6 +240,7 @@ class MinMaxConfig:
     training: MinMaxTrainingConfig = field(default_factory=MinMaxTrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     save_dir: str = "./outputs"
     seed: int = 42
 
@@ -258,36 +257,6 @@ class MinMaxConfig:
             self.policy_model.max_new_tokens,
             self.monitor_model.max_new_tokens
         )
-
-    def compute_max_story_tokens(self, pipeline_type: str = "minmax", 
-                               template_overhead: int = 200) -> int:
-        """
-        Compute max_story_tokens based on pipeline type and model constraints
-        
-        Args:
-            pipeline_type: "minmax" or "rlhf"
-            template_overhead: Tokens used by prompt template (excluding story)
-            
-        Returns:
-            Maximum tokens available for story content
-        """
-        if pipeline_type == "minmax":
-            # For MinMax: monitor prompt includes policy generation, so account for both
-            # Monitor prompt = story + question + choices + policy_response + template
-            available_tokens = (self.monitor_model.max_length - 
-                              template_overhead - 
-                              self.policy_model.max_new_tokens -  # Policy generation in monitor input
-                              self.monitor_model.max_new_tokens - # Monitor generation
-                              self.data.safety_margin)
-        else:  # RLHF
-            # For RLHF: policy prompt only needs story + question + choices + template
-            available_tokens = (self.policy_model.max_length - 
-                              template_overhead - 
-                              self.policy_model.max_new_tokens - 
-                              self.data.safety_margin)
-        
-        self.data.max_story_tokens = max(available_tokens, 100)  # Minimum 100 tokens
-        return self.data.max_story_tokens
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'MinMaxConfig':
@@ -360,8 +329,7 @@ def create_model_configs_from_dict(config_dict: dict):
     policy_config = dict_to_config(config_dict.get('policy_model', {}), PolicyModelConfig)
     reward_config = dict_to_config(config_dict.get('reward_model', {}), RewardModelConfig)
     judge_config = dict_to_config(config_dict.get('judge_model', {}), JudgeModelConfig)
-    monitor_config = dict_to_config(config_dict.get('monitor_model', {}), MonitorModelConfig)
-    return policy_config, reward_config, judge_config, monitor_config
+    return policy_config, reward_config, judge_config
 
 def create_minmax_model_configs_from_dict(config_dict: Dict[str, Any]):
     """Create model configs from dictionary for minmax training"""

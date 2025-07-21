@@ -9,7 +9,12 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import (
+    LoraConfig, 
+    get_peft_model, 
+    TaskType, 
+    prepare_model_for_kbit_training
+)
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -34,9 +39,12 @@ class PolicyModel:
             self.lora_alpha = 32
             self.lora_dropout = 0.1
             self.max_length = 512
+            self.max_new_tokens = 50
             self.temperature = 0.7
             self.top_p = 0.9
             self.do_sample = True
+            # Add use_lora configuration option  
+            self.use_lora = True  # Default to True for backward compatibility
         else:
             self.model_name = config.model_name
             self.load_in_8bit = config.load_in_8bit
@@ -44,9 +52,12 @@ class PolicyModel:
             self.lora_alpha = config.lora_alpha
             self.lora_dropout = config.lora_dropout
             self.max_length = config.max_length
+            self.max_new_tokens = config.max_new_tokens
             self.temperature = config.temperature
             self.top_p = config.top_p
             self.do_sample = config.do_sample
+            # Add use_lora configuration option
+            self.use_lora = getattr(config, 'use_lora', True)  # Default to True for backward compatibility
             
         # Set target device to cuda:0 for PPO compatibility
         self.target_device = device if device is not None else "cuda:0"
@@ -91,38 +102,55 @@ class PolicyModel:
             low_cpu_mem_usage=True  # Important for multi-user environment
         )
         
-        # Select the appropriate LoRA target modules based on model type
-        if "gpt2" in self.model_name.lower() or "dialogpt" in self.model_name.lower():
-            # GPT-2/DialoGPT architecture
-            target_modules = ["c_attn", "c_proj"]
-            logger.info(f"Using GPT-2/DialoGPT target modules: {target_modules}")
-        elif "mistral" in self.model_name.lower():
-            # Mistral architecture
-            target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-            logger.info(f"Using Mistral target modules: {target_modules}")
-        elif "llama" in self.model_name.lower():
-            # LLaMA architecture
-            target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-            logger.info(f"Using LLaMA target modules: {target_modules}")
+        # Select the appropriate LoRA target modules based on model type (only if using LoRA)
+        if self.use_lora:
+            if "gpt2" in self.model_name.lower() or "dialogpt" in self.model_name.lower():
+                # GPT-2/DialoGPT architecture
+                target_modules = ["c_attn", "c_proj"]
+                logger.info(f"Using GPT-2/DialoGPT target modules: {target_modules}")
+            elif "mistral" in self.model_name.lower():
+                # Mistral architecture
+                target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+                logger.info(f"Using Mistral target modules: {target_modules}")
+            elif "llama" in self.model_name.lower():
+                # LLaMA architecture
+                target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+                logger.info(f"Using LLaMA target modules: {target_modules}")
+            else:
+                # Default to more common modules
+                target_modules = ["query", "value", "key", "dense"]
+                logger.warning(f"Unknown model architecture for {self.model_name}. Using default target modules: {target_modules}")
+        
+        # 3. Prepare the model for k-bit training (enables gradient checkpointing and correct dtype)
+        if self.load_in_8bit:
+            self.model = prepare_model_for_kbit_training(self.model)
+
+        # Configure and apply LoRA (only if use_lora is True)
+        if self.use_lora:
+            # Configure LoRA
+            lora_config = LoraConfig(
+                r=self.lora_r,
+                lora_alpha=self.lora_alpha,
+                target_modules=target_modules,
+                lora_dropout=self.lora_dropout,
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            
+            # Apply LoRA
+            logger.info("Applying LoRA configuration")
+            self.model = get_peft_model(self.model, lora_config)
+            self.model.print_trainable_parameters()    
         else:
-            # Default to more common modules
-            target_modules = ["query", "value", "key", "dense"]
-            logger.warning(f"Unknown model architecture for {self.model_name}. Using default target modules: {target_modules}")
-        
-        # Configure LoRA
-        lora_config = LoraConfig(
-            r=self.lora_r,
-            lora_alpha=self.lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=self.lora_dropout,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-        
-        # Apply LoRA
-        logger.info("Applying LoRA configuration")
-        self.model = get_peft_model(self.model, lora_config)
-        self.model.print_trainable_parameters()
+            # For non-PEFT models, ensure all parameters are trainable for full fine-tuning
+            logger.info("No PEFT/LoRA - using full model fine-tuning")
+            for param in self.model.parameters():
+                param.requires_grad = True
+                
+            # Verify trainable parameters
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(f"Policy model - Trainable parameters (full fine-tuning): {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
         
         logger.info(f"Policy model loaded successfully on {self.target_device}")
         
@@ -141,7 +169,7 @@ class PolicyModel:
             Generated token sequences [batch_size, total_seq_len]
         """
         if max_new_tokens is None:
-            max_new_tokens = self.max_length
+            max_new_tokens = self.max_new_tokens
             
         # Merge generation parameters
         gen_kwargs = {
@@ -156,6 +184,9 @@ class PolicyModel:
         # Move inputs to model device
         input_ids = input_ids.to(self.target_device)
         attention_mask = attention_mask.to(self.target_device)
+        
+        # Set model to evaluation mode for generation (prevents gradient checkpointing warnings)
+        self.model.eval()
         
         with torch.no_grad():
             outputs = self.model.generate(

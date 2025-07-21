@@ -67,6 +67,11 @@ class MinMaxOutput:
     judge_scores: torch.Tensor           # R(O') - judge scores with critiques
     combined_scores: torch.Tensor        # R(O,O') - final combined reward
     truthfulness_penalty: torch.Tensor  # F(π_M) - constraint violation
+    monitor_reward_scores: torch.Tensor  # R(O'_monitor) - reward scores for monitor critiques
+    
+    # Individual constraint penalty components
+    monitor_verdict_penalty: torch.Tensor     # Monitor verdict penalty component (scalar)
+    monitor_reward_penalty: torch.Tensor      # Monitor reward penalty component (scalar)
     
     # Training data for policy (generated_tokens + input_lengths is sufficient)
     policy_input_lengths: List[int]
@@ -102,11 +107,11 @@ class DatasetProcessor:
         self.judge_tokenizer = None
         
         # Store template strings (not Template objects since we use .format())
+        # Templates from dataset config
         self._policy_template_str = None
-        self._reward_template_str = self.config.reward_input_template
-        self._judge_template_str = self.config.judge_input_template
-        self._monitor_template_str = self.config.monitor_critique_template
-        self._judge_with_critique_template_str = self.config.judge_with_critique_template
+        self._judge_template_str = None
+        self._monitor_critique_template_str = None
+        self._judge_with_critique_template_str = None
         
     def set_tokenizers(self, policy_tokenizer, reward_tokenizer, judge_tokenizer, monitor_tokenizer=None):
         """Set tokenizers for all models"""
@@ -175,6 +180,13 @@ class DatasetProcessor:
             logger.info(f"Computed max_story_tokens for RLHF pipeline: {self.config.max_story_tokens}")
             logger.info(f"Policy template overhead: {overhead_tokens} tokens")
         
+        # Initialize all template strings from dataset config
+        self._judge_template_str = self.config.judge_input_template
+        self._monitor_critique_template_str = self.config.monitor_critique_template
+        self._judge_with_critique_template_str = self.config.judge_with_critique_template
+        
+        logger.info("All template strings initialized from dataset configuration")
+        
     # =====================================
     # Policy Model Processing
     # =====================================
@@ -210,8 +222,7 @@ class DatasetProcessor:
             
         # Use config-based max_length calculation  
         max_input_length = (self.policy_model_config.max_length - 
-                           self.policy_model_config.max_new_tokens - 
-                           self.config.safety_margin)
+                           self.policy_model_config.max_new_tokens - 5) # 5 tokens for extra safety margin
             
         # Tokenize batch
         inputs = self.policy_tokenizer(
@@ -221,6 +232,8 @@ class DatasetProcessor:
             truncation=True,
             max_length=max_input_length
         )
+
+        logger.debug(f"Policy tokenization - Shape of input_ids: {inputs['input_ids'].shape}")
         
         # Store input lengths for response extraction
         # Since we use left padding and truncation, all inputs have the same length
@@ -345,7 +358,7 @@ class DatasetProcessor:
         """Extract responses from generated tokens using dataset strategy"""
         if not self.policy_tokenizer:
             raise RuntimeError("Policy tokenizer not set. Call set_tokenizers() first.")
-        
+
         # Since we use left padding, all inputs have the same length
         input_length = input_lengths[0] if input_lengths else generated_tokens.size(1)
         
@@ -357,6 +370,10 @@ class DatasetProcessor:
             # Decode the generated response
             response = self.policy_tokenizer.decode(tokens, skip_special_tokens=True)
             responses.append(response.strip())
+
+            # # DEBUG: Log response extraction details
+            # input_seq = self.policy_tokenizer.decode(generated_tokens[i, :input_length], skip_special_tokens=True)
+            # logger.debug(f"Inputs + Extracted response {i+1}: {input_seq.strip()}[++++++++]{response}")
             
         return responses
     
@@ -501,21 +518,70 @@ class DatasetProcessor:
     # =====================================
     
     def create_reward_inputs_batch(self, questions: List[str], answer_choices_batch: List[List[str]],
-                                 selected_answers: List[str], justifications: List[str]) -> List[str]:
-        """Create reward model inputs using dataset template"""
-        inputs = []
+                                 selected_answers: List[str], justifications: List[str]) -> List[List[Dict]]:
+        """Create reward model conversation inputs using dataset template"""
+        conversations = []
         
         for question, choices, answer, justification in zip(questions, answer_choices_batch, selected_answers, justifications):
-            input_text = self._reward_template_str.format(
+            # Create user message
+            user_content = self.config.reward_conversation_template["user"].format(
                 question=question,
                 choice_a=choices[0],
-                choice_b=choices[1],
+                choice_b=choices[1]
+            )
+            
+            # Create assistant message
+            assistant_content = self.config.reward_conversation_template["assistant"].format(
                 selected_answer=answer,
                 justification=justification
             )
-            inputs.append(input_text)
             
-        return inputs
+            # Create conversation
+            conversation = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content}
+            ]
+            conversations.append(conversation)
+            
+        return conversations
+    
+    def create_monitor_reward_inputs_batch(self, questions: List[str], answer_choices_batch: List[List[str]],
+                                         monitor_critiques: List[str], policy_justifications: List[str] = None) -> List[List[Dict]]:
+        """Create reward model conversation inputs for monitor critiques using differentiated template"""
+        conversations = []
+        
+        for i, (question, choices, critique) in enumerate(zip(questions, answer_choices_batch, monitor_critiques)):
+            if policy_justifications is not None and i < len(policy_justifications):
+                # Use monitor reward conversation template with policy context
+                user_content = self.config.monitor_reward_conversation_template["user"].format(
+                    question=question,
+                    choice_a=choices[0],
+                    choice_b=choices[1],
+                    policy_reasoning=policy_justifications[i]
+                )
+                assistant_content = self.config.monitor_reward_conversation_template["assistant"].format(
+                    monitor_critique=critique
+                )
+            else:
+                # Fallback to standard reward conversation template (backward compatibility)
+                user_content = self.config.reward_conversation_template["user"].format(
+                    question=question,
+                    choice_a=choices[0],
+                    choice_b=choices[1]
+                )
+                assistant_content = self.config.reward_conversation_template["assistant"].format(
+                    selected_answer="",  # No answer available
+                    justification=critique  # Use critique as justification
+                )
+            
+            # Create conversation
+            conversation = [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content}
+            ]
+            conversations.append(conversation)
+            
+        return conversations
     
     def create_judge_inputs_batch(self, questions: List[str], answer_choices_batch: List[List[str]],
                                 selected_answers: List[str], justifications: List[str]) -> List[str]:
@@ -542,7 +608,7 @@ class DatasetProcessor:
         inputs = []
         
         for i, (story, question, choices, answer, ai_response) in enumerate(zip(stories, questions, answer_choices_batch, selected_answers, ai_responses)):
-            input_text = self._monitor_template_str.format(
+            input_text = self._monitor_critique_template_str.format(
                 story=story,
                 question=question,
                 choice_a=choices[0],
@@ -582,21 +648,13 @@ class DatasetProcessor:
             
         return inputs
     
-    def tokenize_reward_batch(self, input_texts: List[str], reward_model_config=None) -> Dict[str, torch.Tensor]:
-        """Tokenize reward model inputs"""
-        if not self.reward_tokenizer:
-            raise RuntimeError("Reward tokenizer not set. Call set_tokenizers() first.")
-        
-        # Use reward model config max_length if provided, otherwise use a reasonable default
-        max_length = reward_model_config.max_length if reward_model_config else 512
-            
-        return self.reward_tokenizer(
-            input_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length
-        )
+    def tokenize_reward_batch(self, conversations: List[List[Dict]], reward_model_config=None) -> List[List[Dict]]:
+        """
+        Pass conversations directly - RewardModel now handles conversation processing internally
+        This method is kept for compatibility but simply returns the conversations
+        """
+        # RewardModel.score_batch now handles tokenization internally
+        return conversations
     
     def tokenize_judge_batch(self, input_texts: List[str], judge_model_config=None) -> Dict[str, torch.Tensor]:
         """Tokenize judge model inputs"""
@@ -629,8 +687,7 @@ class DatasetProcessor:
             
         # Use config-based max_length calculation
         max_input_length = (self.monitor_model_config.max_length - 
-                           self.monitor_model_config.max_new_tokens - 
-                           self.config.safety_margin)
+                           self.monitor_model_config.max_new_tokens - 5) # 5 tokens for extra safety margin
             
         inputs = tokenizer(
             input_texts,

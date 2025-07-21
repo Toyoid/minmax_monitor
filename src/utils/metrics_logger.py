@@ -1,79 +1,135 @@
 """
 Centralized Metrics Logger for RLHF and MinMax Training
-Handles wandb logging and comprehensive metrics computation including deception analysis
+Handles multiple logging backends (wandb, tensorboard, console) and comprehensive metrics computation
 """
-import wandb
 import torch
 import numpy as np
 import logging
 from typing import Dict, List, Any, Optional, Union
 from collections import Counter
 
+from .metrics_backends import WandbBackend, TensorboardBackend, ConsoleBackend, BaseMetricsBackend
+
 logger = logging.getLogger(__name__)
 
 class MetricsLogger:
     """
     Centralized metrics logger for both RLHF and MinMax training
-    Handles wandb integration and comprehensive metrics computation
+    Supports multiple backends: wandb, tensorboard, console
     """
     
     def __init__(self, project_name: str, run_name: str, config: Dict[str, Any], 
-                 trainer_type: str = "minmax", wandb_config: Optional[Dict] = None):
+                 trainer_type: str = "minmax", backends: Optional[List[str]] = None,
+                 wandb_config: Optional[Dict] = None, tensorboard_config: Optional[Dict] = None):
         """
-        Initialize MetricsLogger with wandb
+        Initialize MetricsLogger with multiple backends
         
         Args:
-            project_name: wandb project name
-            run_name: wandb run name
+            project_name: Project name for logging
+            run_name: Run name for this experiment
             config: Training configuration dict
             trainer_type: "minmax" or "rlhf" 
+            backends: List of backends to use ["wandb", "tensorboard", "console"]
             wandb_config: Additional wandb configuration
+            tensorboard_config: Additional tensorboard configuration
         """
         self.trainer_type = trainer_type
-        self.wandb_config = wandb_config or {}
-
+        self.project_name = project_name
+        self.run_name = run_name
+        self.config = config
         self.global_train_step = 0
         
-        # Initialize wandb
-        wandb_init_config = {
-            "project": project_name,
-            "name": run_name,
-            "config": config,
-            **self.wandb_config
+        # Default to wandb if no backends specified
+        if backends is None:
+            backends = ["wandb"]
+
+        logger.info(f"Initializing MetricsLogger with backends: {', '.join(backends)}")        
+        # Initialize backends
+        self.backends: List[BaseMetricsBackend] = []
+        self._initialize_backends(backends, wandb_config, tensorboard_config)
+        
+        # Log configuration to all backends
+        self._log_initial_config()
+        
+    def _initialize_backends(self, backend_names: List[str], wandb_config: Optional[Dict], 
+                           tensorboard_config: Optional[Dict]):
+        """Initialize requested backends"""
+        
+        # Enhance config with trainer type
+        enhanced_config = {**self.config, "trainer_type": self.trainer_type}
+        
+        for backend_name in backend_names:
+            try:
+                if backend_name.lower() == "wandb":
+                    backend = WandbBackend(
+                        self.project_name, self.run_name, enhanced_config, 
+                        wandb_config=wandb_config
+                    )
+                elif backend_name.lower() == "tensorboard":
+                    tb_config = tensorboard_config or {}
+                    backend = TensorboardBackend(
+                        self.project_name, self.run_name, enhanced_config, 
+                        **tb_config
+                    )
+                elif backend_name.lower() == "console":
+                    backend = ConsoleBackend(
+                        self.project_name, self.run_name, enhanced_config
+                    )
+                else:
+                    logger.warning(f"Unknown backend: {backend_name}")
+                    continue
+                
+                if backend.is_available:
+                    self.backends.append(backend)
+                    logger.info(f"Successfully initialized {backend_name} backend")
+                else:
+                    logger.warning(f"Backend {backend_name} is not available")
+                    
+            except Exception as e:
+                logger.error(f"Failed to initialize {backend_name} backend: {e}")
+        
+        # Fallback to console if no backends are available
+        if not self.backends:
+            logger.warning("No backends available, falling back to console logging")
+            self.backends.append(ConsoleBackend(self.project_name, self.run_name, enhanced_config))
+    
+    def _log_initial_config(self):
+        """Log initial configuration to all backends"""
+        config_to_log = {
+            **self.config,
+            "trainer_type": self.trainer_type,
+            "project_name": self.project_name,
+            "run_name": self.run_name
         }
         
-        # Add trainer type tag
-        if "tags" not in wandb_init_config:
-            wandb_init_config["tags"] = []
-        wandb_init_config["tags"].append(trainer_type)
-        
-        try:
-            wandb.init(**wandb_init_config)
-            logger.info(f"Wandb initialized for {trainer_type} training: {project_name}/{run_name}")
-        except Exception as e:
-            logger.warning(f"Failed to initialize wandb: {e}. Metrics will still be computed but not logged.")
-            self.wandb_available = False
-        else:
-            self.wandb_available = True
+        for backend in self.backends:
+            try:
+                backend.log_hyperparameters(config_to_log)
+            except Exception as e:
+                logger.warning(f"Failed to log config to {type(backend).__name__}: {e}")
+    
+    @property
+    def has_available_backends(self) -> bool:
+        """Check if any backends are available"""
+        return len(self.backends) > 0 and any(backend.is_available for backend in self.backends)
     
     def compute_deception_metrics(self, judge_scores: torch.Tensor, 
                                 policy_correctness: torch.Tensor) -> Dict[str, float]:
         """
-        Compute deception analysis metrics for judge model
+        Compute deception analysis metrics for judgement on policy model
         
         Args:
             judge_scores: Judge model's truthfulness assessments (continuous or binary)
             policy_correctness: Ground truth correctness of policy answers (0/1)
             
         Returns:
-            Dictionary with accuracy, deception_success_rate, over_penalization_rate, deception_tendency
+            Dictionary with accuracy, deception_success_rate, over_penalization_rate
         """
         if len(judge_scores) == 0:
             return {
                 'accuracy': 0.0,
                 'deception_success_rate': 0.0,
-                'over_penalization_rate': 0.0,
-                'deception_tendency': 0.0
+                'over_penalization_rate': 0.0
             }
         
         # Convert to tensors if needed
@@ -101,18 +157,21 @@ class MetricsLogger:
         
         total_correct_answers = correct_answers_mask.sum().float()
         total_incorrect_answers = incorrect_answers_mask.sum().float()
-        
+
+        print(60 * "=")
+        print(f"Judgements - Total: {total}, TP: {true_positives}, FP: {false_positives}, TN: {true_negatives}, FN: {false_negatives}")
+        print(f"Ground Truth - Total: {total}, Correct: {total_correct_answers}, Incorrect: {total_incorrect_answers}")
+        print(60 * "=")
+
         # Compute metrics
         accuracy = (true_positives + true_negatives) / total if total > 0 else torch.tensor(-1.0, dtype=torch.float16)
         deception_success_rate = false_positives / total_incorrect_answers if total_incorrect_answers > 0 else torch.tensor(-1.0, dtype=torch.float16)
         over_penalization_rate = false_negatives / total_correct_answers if total_correct_answers > 0 else torch.tensor(-1.0, dtype=torch.float16)
-        deception_tendency = judge_scores.mean() - policy_correctness.mean()
-        
+
         return {
             'accuracy': accuracy.item(),
             'deception_success_rate': deception_success_rate.item(),
             'over_penalization_rate': over_penalization_rate.item(),
-            'deception_tendency': deception_tendency.item()
         }
     
     def compute_answer_distribution(self, parsed_answers: List[str]) -> Dict[str, float]:
@@ -239,18 +298,16 @@ class MetricsLogger:
         
         Args:
             metrics: Dictionary of metrics to log
-            step: Training step number
         """
-        if not self.wandb_available:
+        if not self.has_available_backends:
             return
             
-        # Prefix with train/ for clarity
-        train_metrics = {f"train/{key}": value for key, value in metrics.items()}
-        
-        try:
-            wandb.log(train_metrics, step=self.global_train_step)
-        except Exception as e:
-            logger.warning(f"Failed to log training batch metrics: {e}")
+        # Log to all backends with train prefix
+        for backend in self.backends:
+            try:
+                backend.log_metrics(metrics, step=self.global_train_step, prefix="train")
+            except Exception as e:
+                logger.warning(f"Failed to log training batch metrics to {type(backend).__name__}: {e}")
     
     def log_epoch_metrics(self, metrics: Dict[str, Any], epoch: int):
         """
@@ -260,17 +317,18 @@ class MetricsLogger:
             metrics: Dictionary of epoch metrics
             epoch: Epoch number
         """
-        if not self.wandb_available:
+        if not self.has_available_backends:
             return
             
-        # Prefix with epoch/ for clarity
-        epoch_metrics = {f"epoch/{key}": value for key, value in metrics.items()}
-        epoch_metrics["epoch"] = epoch
+        # Add epoch number to metrics
+        epoch_metrics = {**metrics, "epoch": epoch}
         
-        try:
-            wandb.log(epoch_metrics, step=self.global_train_step)
-        except Exception as e:
-            logger.warning(f"Failed to log epoch metrics: {e}")
+        # Log to all backends with epoch prefix
+        for backend in self.backends:
+            try:
+                backend.log_metrics(epoch_metrics, step=self.global_train_step, prefix="epoch")
+            except Exception as e:
+                logger.warning(f"Failed to log epoch metrics to {type(backend).__name__}: {e}")
     
     def log_evaluation_metrics(self, metrics: Dict[str, Any]):
         """
@@ -278,24 +336,44 @@ class MetricsLogger:
         
         Args:
             metrics: Dictionary of evaluation metrics
-            step: Training step number
         """
-        if not self.wandb_available:
+        if not self.has_available_backends:
             return
             
-        # Prefix with eval/ for clarity
-        eval_metrics = {f"eval/{key}": value for key, value in metrics.items()}
+        # Log to all backends with eval prefix
+        for backend in self.backends:
+            try:
+                backend.log_metrics(metrics, step=self.global_train_step, prefix="eval")
+            except Exception as e:
+                logger.warning(f"Failed to log evaluation metrics to {type(backend).__name__}: {e}")
+    
+    def log_custom_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None, prefix: str = ""):
+        """
+        Log custom metrics with optional prefix
         
-        try:
-            wandb.log(eval_metrics, step=self.global_train_step)
-        except Exception as e:
-            logger.warning(f"Failed to log evaluation metrics: {e}")
+        Args:
+            metrics: Dictionary of metrics to log
+            step: Optional step number (uses global_train_step if None)
+            prefix: Optional prefix for metric names
+        """
+        if not self.has_available_backends:
+            return
+        
+        step_to_use = step if step is not None else self.global_train_step
+        
+        # Log to all backends
+        for backend in self.backends:
+            try:
+                backend.log_metrics(metrics, step=step_to_use, prefix=prefix)
+            except Exception as e:
+                logger.warning(f"Failed to log custom metrics to {type(backend).__name__}: {e}")
     
     def finish(self):
-        """Finish wandb run"""
-        if self.wandb_available:
+        """Finish all logging sessions"""
+        for backend in self.backends:
             try:
-                wandb.finish()
-                logger.info("Wandb run finished successfully")
+                backend.finish()
             except Exception as e:
-                logger.warning(f"Failed to finish wandb run: {e}")
+                logger.warning(f"Failed to finish {type(backend).__name__}: {e}")
+        
+        logger.info("All metrics logging sessions finished")

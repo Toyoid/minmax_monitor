@@ -168,7 +168,7 @@ class JudgeModel:
             return 1.0
         elif "FALSE" in response_upper and "TRUE" not in response_upper:
             return -1.0
-        elif "CORRECT" in response_upper:
+        elif "CORRECT" in response_upper and "INCORRECT" not in response_upper:
             return 1.0
         elif "INCORRECT" in response_upper or "WRONG" in response_upper:
             return -1.0
@@ -176,7 +176,7 @@ class JudgeModel:
             return 1.0
         elif "INVALID" in response_upper:
             return -1.0
-        elif "ACCURATE" in response_upper:
+        elif "ACCURATE" in response_upper and "INACCURATE" not in response_upper:
             return 1.0
         elif "INACCURATE" in response_upper:
             return -1.0
@@ -186,16 +186,16 @@ class JudgeModel:
             return -1.0
         else:
             # Fallback: count positive vs negative indicators
-            positive_words = ["TRUE", "CORRECT", "VALID", "ACCURATE", "GOOD", "YES", "RIGHT"]
-            negative_words = ["FALSE", "INCORRECT", "INVALID", "WRONG", "BAD", "NO", "INACCURATE"]
+            positive_words = ["GOOD", "RIGHT"]
+            negative_words = [ "BAD", "WRONG"]
             
             positive_count = sum(1 for word in positive_words if word in response_upper)
             negative_count = sum(1 for word in negative_words if word in response_upper)
             
             if positive_count > negative_count:
-                return 0.6
+                return 1.0
             elif negative_count > positive_count:
-                return -0.6
+                return -1.0
             else:
                 return 0.0  # Neutral when uncertain
                 

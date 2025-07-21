@@ -128,7 +128,7 @@ if __name__ == "__main__":
     sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
     
     # Test data loading
-    data_dir = "/data/lhx/minmax_monitor/dataset/qa_simple/data"
+    data_dir = "dataset/qa_simple/data"
     
     print("Testing QA Simple Dataset Loader...")
     

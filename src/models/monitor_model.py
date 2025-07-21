@@ -67,8 +67,13 @@ class MonitorModel:
             trust_remote_code=True
         )
         
+        # Prepare the model for k-bit training (enables gradient checkpointing and correct dtype)
+        if config.load_in_8bit:
+            from peft import prepare_model_for_kbit_training
+            self.model = prepare_model_for_kbit_training(self.model)
+        
         # Setup LoRA if requested
-        if config.use_lora:
+        if getattr(config, 'use_lora', True):  # Default to True for backward compatibility
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=config.lora_r,
@@ -78,18 +83,25 @@ class MonitorModel:
             )
             self.model = get_peft_model(self.model, lora_config)
             logger.info("LoRA configuration applied to monitor model")
+        else:
+            # For non-PEFT models, ensure all parameters are trainable for full fine-tuning
+            logger.info("No PEFT/LoRA - using full model fine-tuning")
+            for param in self.model.parameters():
+                param.requires_grad = True
         
         # Set generation parameters
         self.generation_kwargs = {
             'max_new_tokens': config.max_new_tokens,
             'temperature': config.temperature,
             'do_sample': config.do_sample,
+            'top_p': config.top_p,
             'pad_token_id': self.tokenizer.pad_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
         }
         
-        if config.top_p is not None:
-            self.generation_kwargs['top_p'] = config.top_p
+        # Add optional parameters if specified
+        if hasattr(config, 'repetition_penalty') and config.repetition_penalty is not None:
+            self.generation_kwargs['repetition_penalty'] = config.repetition_penalty
         
         # Update device to actual model device after loading
         self.device = self.target_device
@@ -162,6 +174,9 @@ class MonitorModel:
         # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
+        # Set model to evaluation mode for generation (prevents gradient checkpointing warnings)
+        self.model.eval()
+        
         # Generate critiques
         with torch.no_grad():
             outputs = self.model.generate(
@@ -207,6 +222,9 @@ class MonitorModel:
         # Move inputs to model device
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
+        
+        # Set model to evaluation mode for generation (prevents gradient checkpointing warnings)
+        self.model.eval()
         
         # Generate
         with torch.no_grad():

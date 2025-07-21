@@ -1,36 +1,39 @@
 {
   "policy_model": {
-    "model_name": "gpt2",
-    "load_in_8bit": true,
+    "model_name": "mistralai/Mistral-7B-Instruct-v0.3",
+    "load_in_8bit": false,
+    "use_lora": true,
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.1,
     "temperature": 0.7,
     "top_p": 0.9,
     "do_sample": true,
-    "max_length": 2048,
-    "max_new_tokens": 128
+    "max_length": 1600,
+    "max_new_tokens": 512
   },
   "reward_model": {
     "model_name": "OpenAssistant/reward-model-deberta-v3-large-v2",
     "torch_dtype": "bfloat16",
-    "max_length": 512
+    "max_length": 1024
   },
   "judge_model": {
     "model_name": "mistralai/Mistral-7B-Instruct-v0.3",
     "temperature": 1.0,
     "do_sample": false,
-    "torch_dtype": "bfloat16",
     "load_in_8bit": true,
-    "max_length": 1024,
-    "max_new_tokens": 50
+    "torch_dtype": "bfloat16",
+    "max_length": 2048,
+    "max_new_tokens": 100
   },
   "training": {
-    "learning_rate": 1e-5,
+    "learning_rate": 1e-6,
+    "reward_weight": 0.5,
+    "judge_weight": 0.5,
     "batch_size": 4,
-    "mini_batch_size": 2,
-    "num_train_samples": 80,
-    "ppo_epochs": 2,
+    "mini_batch_size": 4,
+    "num_train_samples": 793,
+    "ppo_epochs": 1,
     "num_epochs": 8,
     "init_kl_coef": 0.02,
     "target_kl": 6.0,
@@ -38,32 +41,35 @@
     "cliprange_value": 0.2,
     "vf_coef": 0.1,
     "max_grad_norm": 0.5,
-    "reward_weight": 0.8,
-    "judge_weight": 0.2,
     "eval_frequency": 2,
     "save_frequency": 5
   },
   "evaluation": {
-    "reward_threshold": 0.5,
-    "judge_threshold": 0.5,
-    "correctness_threshold": 0.3,
-    "num_eval_samples": 100,
-    "log_frequency": 10,
+    "num_eval_samples": 654,
+    "log_frequency": 1,
     "progress_frequency": 5
   },
   "data": {
-    "data_dir": "/data/lhx/minmax_monitor/dataset/qa_simple/data",
-    "max_story_length": 4096,
-    "max_question_length": 256,
-    "safety_margin": 40
+    "data_dir": "dataset/qa_simple/data",
+    "safety_margin": 100,
+    "story_truncation_strategy": "intelligent",
+    "answer_parsing_strategy": "ab_pattern",
+    "response_extraction_strategy": "auto",
+    "answer_choices_format": "AB",
+    "num_choices": 2
   },
-  "wandb": {
-    "project": "rlhf-training",
-    "entity": null,
-    "tags": ["rlhf", "qa_simple", "gpt2"],
-    "log_frequency": 10,
-    "log_evaluation": true,
-    "mode": "online"
+  "logging": {
+    "backends": ["tensorboard"],
+    "tensorboard": {
+      "log_dir": "./tensorboard_logs"
+    },
+    "wandb_config": {
+      "project": "rlhf",
+      "entity": null,
+      "tags": ["rlhf", "qa_simple"],
+      "log_frequency": 5
+    },
+    "enable_console_fallback": true
   },
   "save_dir": "./outputs/rlhf",
   "seed": 42

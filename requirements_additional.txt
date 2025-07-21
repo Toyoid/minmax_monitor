@@ -1,0 +1,22 @@
+# Monitoring
+nvitop
+
+# Data Handling & Numerics
+numpy
+pandas
+
+# Machine Learning Utilities
+scikit-learn
+tqdm
+
+# Experiment Tracking
+wandb
+tensorboard
+
+# Plotting
+matplotlib
+seaborn
+
+# Interactive Development
+jupyterlab
+ipywidgets

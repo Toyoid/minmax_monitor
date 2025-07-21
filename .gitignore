@@ -3,6 +3,7 @@ dataset/__MACOSX/
 dataset/quality/
 move_project.md
 wandb/
+tensorboard_logs/
 
 
 # Byte-compiled / optimized / DLL files

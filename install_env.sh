@@ -34,13 +34,9 @@ echo "🔄 Activating environment..."
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate ${ENV_NAME}
 
-# Install PyTorch via conda (recommended for better CUDA integration)
-echo "🔥 Installing PyTorch via conda (recommended for CUDA compatibility)..."
-conda install pytorch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 pytorch-cuda=12.1 -c pytorch -c nvidia -y
-
-# Install PyTorch dependencies to avoid conflicts
-echo "🔧 Installing PyTorch-compatible dependencies..."
-conda install sympy=1.13.1 -y
+# Install PyTorch
+echo "🔥 Installing PyTorch 2.6.0..."
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Upgrade pip and setuptools
 echo "⬆️ Upgrading pip and base tools..."
@@ -50,6 +46,7 @@ pip install --upgrade pip setuptools wheel
 echo "🤖 Installing core machine learning packages..."
 pip install transformers>=4.30.0
 pip install datasets tokenizers accelerate
+pip install sentencepiece
 
 # Install RLHF training packages
 echo "🎯 Installing RLHF training packages..."
@@ -58,16 +55,17 @@ pip install peft
 
 # Install optimization tools
 echo "⚡ Installing optimization tools..."
-# Install DeepSpeed, bitsandbytes with CUDA support handling
-echo "🔧 Installing DeepSpeed (handling CUDA requirements)..."
-if command -v nvcc &> /dev/null; then
-    echo "✅ CUDA toolkit found, installing DeepSpeed with full CUDA support..."
-    pip install deepspeed
-    pip install bitsandbytes
-else
-    echo "⚠️  CUDA toolkit not found. Installing CUDA toolkit first..."
-    exit 1
-fi
+
+# Install CUDA Toolkit within the conda environment for DeepSpeed/bitsandbytes
+echo "🔧 Installing CUDA Toolkit 12.4 inside the environment..."
+conda install -c "nvidia/label/cuda-12.4.0" cuda-toolkit -y
+
+echo "🔧 Installing DeepSpeed and bitsandbytes..."
+pip install deepspeed
+pip install bitsandbytes
+
+# echo "🔧 Installing FlashAttention..."
+# pip install flash-attn --no-build-isolation
 
 # Install additional dependencies
 echo "📊 Installing additional dependencies..."

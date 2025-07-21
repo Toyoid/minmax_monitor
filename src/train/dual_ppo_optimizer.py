@@ -4,6 +4,7 @@ Implements corrected TTUR with Monitor (inner loop) and Policy (outer loop)
 """
 import torch
 import logging
+import traceback
 from typing import List, Dict, Any, Optional, Tuple
 
 from ..data.dataset_processor import MinMaxOutput
@@ -72,6 +73,7 @@ class DualPPOMinMaxOptimizer:
             ppo_epochs=self.config.ppo_epochs,
             init_kl_coef=self.config.init_kl_coef,
             target_kl=self.config.target_kl,
+            kl_penalty=self.config.kl_penalty,
             cliprange=self.config.cliprange,
             cliprange_value=self.config.cliprange_value,
             vf_coef=self.config.vf_coef,
@@ -82,10 +84,32 @@ class DualPPOMinMaxOptimizer:
         
         logger.info("Creating Policy PPO model on cuda:0")
         
-        # Wrap policy model for PPO
-        self.policy_ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            self.policy_model.get_model_for_training()
-        )
+        # Get the PEFT model and prepare it for PPO training
+        peft_model = self.policy_model.get_model_for_training()
+        peft_model.train()  # Ensure training mode
+        
+        # Detect if this is actually a PEFT model
+        is_peft_model = hasattr(peft_model, 'peft_config') or hasattr(peft_model, 'active_peft_config')
+        logger.info(f"Policy model - PEFT detected: {is_peft_model}")
+        
+        # Verify trainable parameters before wrapping
+        trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in peft_model.parameters())
+        logger.info(f"Policy model - Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+        
+        if trainable_params == 0:
+            logger.error("Policy model has no trainable parameters! Check model configuration.")
+            raise RuntimeError("Policy model has no trainable parameters")
+        
+        # Create PPO-compatible model with value head (correct way)
+        self.policy_ppo_model = AutoModelForCausalLMWithValueHead(peft_model)
+        
+        # Set the is_peft_model attribute that TRL expects
+        self.policy_ppo_model.is_peft_model = is_peft_model
+        
+        # Verify value head was added correctly
+        policy_trainable_after = sum(p.numel() for p in self.policy_ppo_model.parameters() if p.requires_grad)
+        logger.info(f"Policy PPO model - Trainable parameters after value head: {policy_trainable_after:,}")
         
         # Initialize Policy PPO trainer
         self.policy_ppo_trainer = PPOTrainer(
@@ -107,6 +131,7 @@ class DualPPOMinMaxOptimizer:
             ppo_epochs=self.config.ppo_epochs,
             init_kl_coef=self.config.init_kl_coef,
             target_kl=self.config.target_kl,
+            kl_penalty=self.config.kl_penalty,
             cliprange=self.config.cliprange,
             cliprange_value=self.config.cliprange_value,
             vf_coef=self.config.vf_coef,
@@ -117,10 +142,32 @@ class DualPPOMinMaxOptimizer:
         
         logger.info("Creating Monitor PPO model on cuda:0")
         
-        # Wrap monitor model for PPO
-        self.monitor_ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            self.monitor_model.get_model_for_training()
-        )
+        # Get the PEFT model and prepare it for PPO training
+        monitor_peft_model = self.monitor_model.get_model_for_training()
+        monitor_peft_model.train()  # Ensure training mode
+        
+        # Detect if this is actually a PEFT model
+        is_peft_model = hasattr(monitor_peft_model, 'peft_config') or hasattr(monitor_peft_model, 'active_peft_config')
+        logger.info(f"Monitor model - PEFT detected: {is_peft_model}")
+        
+        # Verify trainable parameters before wrapping
+        monitor_trainable_params = sum(p.numel() for p in monitor_peft_model.parameters() if p.requires_grad)
+        monitor_total_params = sum(p.numel() for p in monitor_peft_model.parameters())
+        logger.info(f"Monitor model - Trainable parameters: {monitor_trainable_params:,} / {monitor_total_params:,} ({100*monitor_trainable_params/monitor_total_params:.2f}%)")
+        
+        if monitor_trainable_params == 0:
+            logger.error("Monitor model has no trainable parameters! Check model configuration.")
+            raise RuntimeError("Monitor model has no trainable parameters")
+        
+        # Create PPO-compatible model with value head (correct way)
+        self.monitor_ppo_model = AutoModelForCausalLMWithValueHead(monitor_peft_model)
+        
+        # Set the is_peft_model attribute that TRL expects
+        self.monitor_ppo_model.is_peft_model = is_peft_model
+        
+        # Verify value head was added correctly
+        monitor_trainable_after = sum(p.numel() for p in self.monitor_ppo_model.parameters() if p.requires_grad)
+        logger.info(f"Monitor PPO model - Trainable parameters after value head: {monitor_trainable_after:,}")
         
         # Initialize Monitor PPO trainer
         self.monitor_ppo_trainer = PPOTrainer(
@@ -141,6 +188,10 @@ class DualPPOMinMaxOptimizer:
         Returns:
             Dictionary with training metrics
         """
+        # Ensure models are in training mode for PPO training
+        self.policy_ppo_model.train()
+        self.monitor_ppo_model.train()
+        
         # Extract PPO training data
         policy_queries, policy_responses = self._extract_policy_ppo_data(minmax_output)
         # Validate extracted policy data
@@ -166,19 +217,28 @@ class DualPPOMinMaxOptimizer:
         
         # Use pipeline's computed rewards and constraints (no duplication!)
         combined_rewards = minmax_output.combined_scores
+        judge_rewards = minmax_output.judge_scores
         truthfulness_penalties = minmax_output.truthfulness_penalty
         
         logger.debug(f"TTUR step - Combined rewards mean: {combined_rewards.mean():.4f}")
         logger.debug(f"TTUR step - Truthfulness penalties mean: {truthfulness_penalties.mean():.4f}")
         logger.debug(f"TTUR step - Current λ: {self.lambda_multiplier:.4f}")
         
+        # Update constraint multiplier using dual ascent before the monitor update to avoid one-step lag
+        avg_violation = truthfulness_penalties.mean().item()
+        self.lambda_multiplier += self.dual_ascent_step_size * (avg_violation - self.constraint_threshold)
+        # Clamp lambda to reasonable range
+        self.lambda_multiplier = max(0.0, min(15.0, self.lambda_multiplier))
+        logger.debug(f"Constraint update - Average violation: {avg_violation:.4f}, Threshold: {self.constraint_threshold:.4f}")        
+        logger.debug(f"Constraint update - Updated λ: {self.lambda_multiplier:.4f}")
+
+        # TTUR: Inner loop - Update monitor multiple times
         policy_metrics = {}
         monitor_metrics = {}
-        # TTUR: Inner loop - Update monitor multiple times
         logger.debug(f"Inner loop: Updating monitor {self.monitor_updates_per_policy} times")
         for i in range(self.monitor_updates_per_policy):
             # Monitor objective: maximize E[-R(O,O') - λ·F(π_M)]
-            monitor_rewards = -combined_rewards - self.lambda_multiplier * truthfulness_penalties
+            monitor_rewards = -judge_rewards - self.lambda_multiplier * truthfulness_penalties
             
             # Convert rewards to list for PPO trainer
             monitor_reward_list = [torch.tensor(r.item(), dtype=torch.float32) for r in monitor_rewards]
@@ -194,11 +254,14 @@ class DualPPOMinMaxOptimizer:
                 
                 logger.debug(f"Monitor PPO step {i+1} completed successfully")
                 
-                if i == 0:  # Store metrics from first monitor update
+                if i == self.monitor_updates_per_policy - 1:  # Store metrics from first monitor update
                     monitor_metrics = step_metrics
                     
             except Exception as e:
-                logger.warning(f"Monitor PPO step {i+1} failed: {e}")
+                # logger.warning(f"Monitor PPO step {i+1} failed: {e}")
+                stack_trace = traceback.format_exc()
+                logger.error(f"Monitor PPO step {i+1} failed, error trace: {stack_trace}")
+
                 if i == 0:
                     monitor_metrics = {"ppo/loss/total": 0.0, "ppo/mean_kl": 0.0}
         
@@ -216,34 +279,28 @@ class DualPPOMinMaxOptimizer:
                 scores=policy_reward_list
             )
         except Exception as e:
-            logger.warning(f"Policy PPO step failed: {e}")
+            stack_trace = traceback.format_exc()
+            logger.error(f"Policy PPO step failed, error trace: {stack_trace}")
             policy_metrics = {"ppo/loss/total": 0.0, "ppo/mean_kl": 0.0}
         
-        # Update constraint multiplier using dual ascent
-        avg_violation = truthfulness_penalties.mean().item()
-        
-        if avg_violation > self.constraint_threshold:
-            self.lambda_multiplier *= (1.0 + self.dual_ascent_step_size)
-        else:
-            self.lambda_multiplier *= (1.0 - self.dual_ascent_step_size)
-        
-        # Clamp lambda to reasonable range
-        self.lambda_multiplier = max(0.001, min(10.0, self.lambda_multiplier))
-        
-        logger.debug(f"Constraint update - Average violation: {avg_violation:.4f}")
-        logger.debug(f"Constraint update - Updated λ: {self.lambda_multiplier:.4f}")
-        
+        # print(f"\n=================================")
+        # print(f"    Monitor PPO Step Metrics: ")
+        # print(f"=================================")
+        # for key in monitor_metrics.keys():
+        #     print(f"  - {key}: {monitor_metrics[key]}")
+        # print("\n")
+
         return {
             'policy_loss': policy_metrics.get('ppo/loss/total', 0.0),
-            'policy_kl': policy_metrics.get('ppo/mean_kl', 0.0),
-            'policy_entropy': policy_metrics.get('ppo/mean_entropy', 0.0),
+            'policy_kl': policy_metrics.get('objective/kl', 0.0),
+            'policy_entropy': policy_metrics.get('objective/entropy', 0.0),
             'monitor_loss': monitor_metrics.get('ppo/loss/total', 0.0),
-            'monitor_kl': monitor_metrics.get('ppo/mean_kl', 0.0),
-            'monitor_entropy': monitor_metrics.get('ppo/mean_entropy', 0.0),
+            'monitor_kl': monitor_metrics.get('objective/kl', 0.0),
+            'monitor_entropy': monitor_metrics.get('objective/entropy', 0.0),
             'avg_violation': avg_violation,
             'lambda': self.lambda_multiplier,
             'policy_reward': policy_rewards.mean().item(),
-            'monitor_reward': (-combined_rewards - self.lambda_multiplier * truthfulness_penalties).mean().item()
+            'monitor_reward': monitor_rewards.mean().item()
         }
     
     def _extract_policy_ppo_data(self, minmax_output: MinMaxOutput) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:

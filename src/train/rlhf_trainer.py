@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Dataset-Agnostic RLHF Training Script  
-Main training pipeline using the new dataset-agnostic architecture
+Main RLHF Training Script  
 """
 import os
 import sys
@@ -17,10 +16,10 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from src.config.model_config import RLHFConfig, create_model_configs_from_dict
+from src.config.model_config import RLHFConfig
 from src.config.dataset_config import QASimpleConfig
 from src.data.qa_processor import create_qa_simple_dataloader
-from src.data.dataset_processor import DatasetProcessor, RawBatchData
+from src.data.dataset_processor import DatasetProcessor
 from src.models.policy_model import PolicyModel
 from src.models.reward_model import RewardModel
 from src.models.judge_model import JudgeModel
@@ -30,28 +29,26 @@ from src.utils.metrics_logger import MetricsLogger
 # TRL imports for PPO training
 try:
     from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
-    from trl.core import LengthSampler
-    import wandb
     TRL_AVAILABLE = True
 except ImportError:
-    print("TRL not available. Please install with: pip install trl")
+    print("TRL not available. Please install trl")
     TRL_AVAILABLE = False
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 class RLHFTrainer:
     """
-    Dataset-agnostic RLHF trainer using the new pipeline architecture with multi-GPU support
+    Dataset-agnostic RLHF trainer
     """
     
     def __init__(self, config_path: str, dataset_name: str = "qa_simple", eval_only: bool = False):
         # Setup GPU environment first
-        from src.utils.env_setup import setup_gpu_environment, print_environment_info
+        from src.utils.env_setup import setup_gpu_environment
         from src.utils.device_manager import create_device_manager
         
         available_gpus = setup_gpu_environment()
@@ -86,51 +83,73 @@ class RLHFTrainer:
         if not eval_only and TRL_AVAILABLE:
             self._setup_ppo_trainer()
         
-        logger.info("Dataset-agnostic RLHF trainer initialized successfully")
+        logger.info("RLHF trainer initialized successfully")
     
     def _setup_metrics_logger(self):
-        """Setup MetricsLogger for wandb integration"""
-        # Extract wandb config from training config if available
-        wandb_config = getattr(self.config, 'wandb', {})
+        """Setup MetricsLogger with configurable backends"""
+        # Extract logging config
+        logging_config = getattr(self.config, 'logging', {})
+        
+        # Get backends list (default to wandb for backward compatibility)
+        backends = getattr(logging_config, 'backends', ['wandb'])
+        
+        # Extract backend-specific configs
+        wandb_config = getattr(logging_config, 'wandb_config', {})
+        tensorboard_config = getattr(logging_config, 'tensorboard', {})
         
         # Create run name with timestamp
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"rlhf_{self.dataset_name}_{timestamp}"
         
-        # Get project name from config or use default
-        project_name = wandb_config.get('project', 'rlhf-training')
+        # Get project name from wandb config or use default
+        project_name = wandb_config.get('project', 'rlhf')
         
-        # Initialize MetricsLogger
+        # Initialize MetricsLogger with multiple backends
         try:
             self.metrics_logger = MetricsLogger(
                 project_name=project_name,
                 run_name=run_name,
                 config=self.config.to_dict(),
                 trainer_type="rlhf",
-                wandb_config=wandb_config
+                backends=backends,
+                wandb_config=wandb_config,
+                tensorboard_config=tensorboard_config
             )
-            logger.info("MetricsLogger initialized for RLHF training")
+            logger.info(f"MetricsLogger initialized for RLHF training with backends: {backends}")
         except Exception as e:
-            logger.warning(f"Failed to initialize MetricsLogger: {e}. Training will continue without wandb logging.")
+            logger.warning(f"Failed to initialize MetricsLogger: {e}. Training will continue without logging.")
             self.metrics_logger = None
     
     def _setup_dataset_config(self):
         """Setup dataset-specific configuration"""
         if self.dataset_name == "qa_simple":
-            self.dataset_config = QASimpleConfig()
-            self.data_dir = self.config.data.data_dir
+            # Get data config from loaded configuration
+            data_config = self.config.data
+            
+            # Create QASimpleConfig with values from config file
+            self.dataset_config = QASimpleConfig(
+                safety_margin=getattr(data_config, 'safety_margin', 40),
+                story_truncation_strategy=getattr(data_config, 'story_truncation_strategy', 'intelligent'),
+                answer_parsing_strategy=getattr(data_config, 'answer_parsing_strategy', 'ab_pattern'),
+                response_extraction_strategy=getattr(data_config, 'response_extraction_strategy', 'auto'),
+                answer_choices_format=getattr(data_config, 'answer_choices_format', 'AB'),
+                num_choices=getattr(data_config, 'num_choices', 2)
+            )
+            self.data_dir = data_config.data_dir
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
         
-        logger.info(f"Dataset config: {self.dataset_name}")
+        logger.info(f"Dataset config: {self.dataset_name} with safety_margin={self.dataset_config.safety_margin}")
     
     def _setup_models(self):
         """Initialize all models with distributed device placement"""
         logger.info("Loading models with distributed device placement...")
         
         # Create model configs
-        policy_config, reward_config, judge_config = create_model_configs_from_dict(self.config.to_dict())
+        policy_config = self.config.policy_model
+        reward_config = self.config.reward_model
+        judge_config = self.config.judge_model
         
         # Initialize models on allocated devices
         self.policy_model = PolicyModel(
@@ -149,7 +168,6 @@ class RLHFTrainer:
         )
         
         logger.info("All models loaded successfully")
-        self.device_manager.print_memory_usage()
     
     def _setup_pipeline(self):
         """Setup the RLHF pipeline with device manager"""
@@ -169,7 +187,7 @@ class RLHFTrainer:
             self.reward_model, 
             self.judge_model,
             self.processor,
-            self.device_manager  # Add device manager
+            self.device_manager  
         )
         
         # Set reward weights from config
@@ -188,12 +206,14 @@ class RLHFTrainer:
         
         # Training data
         self.train_dataloader = create_qa_simple_dataloader(
-            self.data_dir, "train", batch_size=batch_size, shuffle=True
+            self.data_dir, "train", batch_size=batch_size, shuffle=True,
+            dataset_processor=self.pipeline.processor
         )
         
         # Validation data
         self.val_dataloader = create_qa_simple_dataloader(
-            self.data_dir, "val", batch_size=batch_size, shuffle=False
+            self.data_dir, "val", batch_size=batch_size, shuffle=False,
+            dataset_processor=self.pipeline.processor
         )
         
         logger.info(f"Data loaders created - Train: {len(self.train_dataloader.dataset)}, "
@@ -219,6 +239,7 @@ class RLHFTrainer:
             ppo_epochs=self.config.training.ppo_epochs,
             init_kl_coef=self.config.training.init_kl_coef,
             target_kl=self.config.training.target_kl,
+            kl_penalty=self.config.training.kl_penalty,
             cliprange=self.config.training.cliprange,
             cliprange_value=self.config.training.cliprange_value,
             vf_coef=self.config.training.vf_coef,
@@ -232,24 +253,107 @@ class RLHFTrainer:
         ppo_device = self.device_manager.get_ppo_device()
         logger.info(f"PPO trainer will use device: {ppo_device}")
         
-        # Wrap policy model for PPO
-        self.ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            self.policy_model.get_model_for_training()
-        )
+        # Get the model for PPO training and prepare it
+        try:
+            policy_model_for_training = self.policy_model.get_model_for_training()
+            policy_model_for_training.train()  # Ensure training mode
+            
+            # Detect if this is actually a PEFT model
+            is_peft_model = hasattr(policy_model_for_training, 'peft_config') or hasattr(policy_model_for_training, 'active_peft_config')
+            logger.info(f"Policy model - PEFT detected: {is_peft_model}")
+            
+            # Verify trainable parameters before wrapping
+            trainable_params = sum(p.numel() for p in policy_model_for_training.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in policy_model_for_training.parameters())
+            logger.info(f"Policy model - Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+            
+            if trainable_params == 0:
+                logger.error("Policy model has no trainable parameters! Check model configuration.")
+                raise RuntimeError("Policy model has no trainable parameters")
+            
+            # Wrap policy model for PPO (correct way)
+            self.ppo_model = AutoModelForCausalLMWithValueHead(policy_model_for_training)
+            
+            # Set the is_peft_model attribute that TRL expects
+            self.ppo_model.is_peft_model = is_peft_model
+            
+            # Verify value head was added correctly
+            ppo_trainable_after = sum(p.numel() for p in self.ppo_model.parameters() if p.requires_grad)
+            logger.info(f"PPO model - Trainable parameters after value head: {ppo_trainable_after:,}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create PPO model: {e}")
+            raise RuntimeError(f"PPO model creation failed: {e}")
         
         # Move PPO model to designated device if different from policy
-        if ppo_device != self.device_manager.get_policy_device():
-            logger.info(f"Moving PPO model from {self.device_manager.get_policy_device()} to {ppo_device}")
-            self.ppo_model = self.ppo_model.to(ppo_device)
+        try:
+            if ppo_device != self.device_manager.get_policy_device():
+                logger.info(f"Moving PPO model from {self.device_manager.get_policy_device()} to {ppo_device}")
+                self.ppo_model = self.ppo_model.to(ppo_device)
+        except Exception as e:
+            logger.error(f"Failed to move PPO model to device {ppo_device}: {e}")
+            raise RuntimeError(f"Device movement failed: {e}")
         
         # Initialize PPO trainer
-        self.ppo_trainer = PPOTrainer(
-            config=ppo_config,
-            model=self.ppo_model,
-            tokenizer=self.policy_model.get_tokenizer(),
-        )
+        try:
+            self.ppo_trainer = PPOTrainer(
+                config=ppo_config,
+                model=self.ppo_model,
+                tokenizer=self.policy_model.get_tokenizer(),
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize PPO trainer: {e}")
+            raise RuntimeError(f"PPO trainer initialization failed: {e}")
         
         logger.info("PPO trainer initialized")
+    
+    def _ppo_training_step(self, rlhf_output, combined_rewards_tensor):
+        """
+        Execute a single PPO training step
+        
+        Args:
+            rlhf_output: Output from RLHF pipeline
+            combined_rewards_tensor: Combined reward tensor
+            
+        Returns:
+            PPO training statistics or None if failed
+        """
+        # Prepare data for PPO training
+        queries = []
+        responses = []
+        scores = []
+        
+        for i in range(len(rlhf_output.policy_input_lengths)):
+            input_len = rlhf_output.policy_input_lengths[i]
+            full_sequence = rlhf_output.generated_tokens[i]
+            
+            # Query: original input prompt
+            query_tensor = full_sequence[:input_len]
+            # Response: newly generated tokens
+            response_tensor = full_sequence[input_len:]
+            
+            # Move tensors to PPO device if needed
+            ppo_device = self.device_manager.get_ppo_device()
+            if ppo_device != str(query_tensor.device):
+                query_tensor = query_tensor.to(ppo_device)
+                response_tensor = response_tensor.to(ppo_device)
+                combined_rewards_tensor = combined_rewards_tensor.to(ppo_device)
+            
+            queries.append(query_tensor)
+            responses.append(response_tensor)
+            scores.append(combined_rewards_tensor[i])
+        
+        # Single PPO training step for the batch
+        try:
+            train_stats = self.ppo_trainer.step(
+                queries=queries,
+                responses=responses, 
+                scores=scores
+            )
+            return train_stats
+        except Exception as ppo_error:
+            logger.warning(f"PPO step failed: {ppo_error}")
+            return None
     
     def train(self, num_epochs: Optional[int] = None):
         """
@@ -260,37 +364,53 @@ class RLHFTrainer:
             return self.evaluate()
         
         if not TRL_AVAILABLE:
-            raise RuntimeError("TRL is required for training. Install with: pip install trl")
+            raise RuntimeError("TRL is required for training. ")
         
         num_epochs = num_epochs or self.config.training.num_epochs
         logger.info(f"Starting RLHF training for {num_epochs} epochs")
         
         # Training metrics
         training_stats = {
-            "epoch_rewards": [],
-            "epoch_judge_scores": [],
-            "epoch_correctness": [],
-            "epoch_losses": []
+            "epoch_combined_rewards": [],
+            "epoch_reward_scores": [],
+            "epoch_judge_scores": [], 
+            "epoch_accuracies": [],
+            "epoch_policy_losses": []
         }
+        
+        # Ensure models are in training mode at start
+        try:
+            self.ppo_model.train()
+            logger.info("Models set to training mode")
+        except Exception as e:
+            logger.error(f"Failed to set models to training mode: {e}")
+            raise RuntimeError(f"Model mode setting failed: {e}")
         
         for epoch in range(num_epochs):
             logger.info(f"=== Epoch {epoch + 1}/{num_epochs} ===")
             
-            epoch_metrics = self._train_epoch()
+            try:
+                epoch_metrics = self._train_epoch()
+            except Exception as e:
+                logger.error(f"Error in epoch {epoch + 1}: {e}")
+                # Continue with next epoch or break depending on severity
+                continue
             
             # Log metrics
-            training_stats["epoch_rewards"].append(epoch_metrics["mean_reward"])
+            training_stats["epoch_combined_rewards"].append(epoch_metrics["mean_combined_reward"])
+            training_stats["epoch_reward_scores"].append(epoch_metrics["mean_reward_score"])
             training_stats["epoch_judge_scores"].append(epoch_metrics["mean_judge_score"])
-            training_stats["epoch_correctness"].append(epoch_metrics["mean_correctness"])
-            training_stats["epoch_losses"].append(epoch_metrics["mean_loss"])
+            training_stats["epoch_accuracies"].append(epoch_metrics["mean_accuracy"])
+            training_stats["epoch_policy_losses"].append(epoch_metrics["mean_policy_loss"])
             
             # Log epoch-level metrics to wandb
             if self.metrics_logger:
                 epoch_wandb_metrics = {
-                    'reward': epoch_metrics["mean_reward"],
+                    'combined_reward': epoch_metrics["mean_combined_reward"],
+                    'reward_score': epoch_metrics["mean_reward_score"],
                     'judge_score': epoch_metrics["mean_judge_score"],
-                    'correctness': epoch_metrics["mean_correctness"],
-                    'loss': epoch_metrics["mean_loss"],
+                    'accuracy': epoch_metrics["mean_accuracy"],
+                    'policy_loss': epoch_metrics["mean_policy_loss"],
                 }
                 self.metrics_logger.log_epoch_metrics(epoch_wandb_metrics, epoch + 1)
             
@@ -312,23 +432,32 @@ class RLHFTrainer:
         return training_stats
     
     def _train_epoch(self):
-        """Train for one epoch with comprehensive metrics logging"""
-        # Initialize metric collectors
-        total_rewards = []
-        total_judge_scores = []
-        total_correctness = []
-        total_losses = []
+        """Train for one epoch with clean metrics collection
         
-        # Additional metrics for comprehensive logging
-        reward_scores_all = []
-        judge_scores_all = []
-        policy_correctness_all = []
-        judge_correctness_all = []
-        parsed_answers_all = []
+        Metrics logged during training:
+        1. accuracies (of policy)
+        2. reward_scores (from the reward model)
+        3. judge_scores
+        4. combined_rewards 
+        5. policy_losses
+        6. judge deception metrics (computed by self.metrics_logger.compute_deception_metrics)
+        """
+        # Initialize epoch-level metric collectors
+        accuracies = []
+        reward_scores = []  # Will be computed from reward_scores_all
+        judge_scores = []
+        combined_rewards = []
+        policy_losses = []
         
-        self.ppo_model.train()
+        # Set model to training mode
+        try:
+            self.ppo_model.train()
+            logger.debug("PPO model set to training mode for epoch")
+        except Exception as e:
+            logger.error(f"Failed to set PPO model to training mode: {e}")
+            raise RuntimeError(f"Training mode setting failed: {e}")
         
-        # Check if we should limit the number of training samples
+        # Check training sample limit
         num_train_samples = self.config.training.num_train_samples
         samples_processed = 0
         
@@ -351,86 +480,43 @@ class RLHFTrainer:
                     max_new_tokens=self.config.policy_model.max_new_tokens // 4
                 )
                 
-                # Compute combined reward (moved to pipeline)
-                combined_rewards = self.pipeline.compute_combined_reward(rlhf_output)
+                # Compute combined reward tensor
+                combined_rewards_tensor = self.pipeline.compute_combined_reward(rlhf_output)
                 
-                # Collect additional metrics for comprehensive analysis
-                reward_scores_all.extend(rlhf_output.reward_scores.cpu().tolist())
-                judge_scores_all.extend(rlhf_output.judge_scores.cpu().tolist())
-                policy_correctness_all.extend(rlhf_output.ground_truth_correct.cpu().tolist())
-                parsed_answers_all.extend(rlhf_output.parsed_answers)
+                # Debug prints (following MinMax pattern)
+                print("Combined rewards:")
+                print(60 * "=")
+                print(combined_rewards_tensor)
+                print(60 * "=")
                 
-                # Judge correctness: binary threshold on judge scores
-                judge_binary = (rlhf_output.judge_scores > 0.5).float()
-                judge_correctness_batch = (judge_binary == rlhf_output.ground_truth_correct).float()
-                judge_correctness_all.extend(judge_correctness_batch.cpu().tolist())
+                # PPO training step
+                train_stats = self._ppo_training_step(rlhf_output, combined_rewards_tensor)
                 
-                # Split large batch into mini-batches for PPO training
-                mini_batch_size = self.config.training.mini_batch_size
-                batch_size = len(rlhf_output.policy_input_lengths)
+                # Collect batch-level metrics 
+                batch_accuracy = rlhf_output.ground_truth_correct.float().mean().item()
+                batch_reward_score = rlhf_output.reward_scores.mean().item()
+                batch_judge_score = rlhf_output.judge_scores.mean().item()
+                batch_combined_reward = combined_rewards_tensor.mean().item()
+                batch_policy_loss = train_stats.get("ppo/loss/total", 0.0) if train_stats else 0.0
                 
-                # Process in mini-batches
-                for start_idx in range(0, batch_size, mini_batch_size):
-                    end_idx = min(start_idx + mini_batch_size, batch_size)
-                    
-                    # Extract mini-batch data
-                    mini_query_list = []
-                    mini_response_list = []
-                    mini_scores_list = []
-                    
-                    for i in range(start_idx, end_idx):
-                        input_len = rlhf_output.policy_input_lengths[i]
-                        full_sequence = rlhf_output.generated_tokens[i]
-                        
-                        # Query: original input prompt
-                        query_tensor = full_sequence[:input_len]
-                        # Response: newly generated tokens
-                        response_tensor = full_sequence[input_len:]
-                        
-                        # Move tensors to PPO device if different from policy device
-                        ppo_device = self.device_manager.get_ppo_device()
-                        if ppo_device != str(query_tensor.device):
-                            query_tensor = query_tensor.to(ppo_device)
-                            response_tensor = response_tensor.to(ppo_device)
-                        
-                        mini_query_list.append(query_tensor)
-                        mini_response_list.append(response_tensor)
-                        mini_scores_list.append(torch.tensor(combined_rewards[i].item(), dtype=torch.float32, device=ppo_device))
-                    
-                    try:
-                        # PPO training step on mini-batch
-                        train_stats = self.ppo_trainer.step(
-                            queries=mini_query_list,
-                            responses=mini_response_list, 
-                            scores=mini_scores_list
-                        )
-                        
-                        if train_stats:
-                            total_losses.append(train_stats.get("ppo/loss/total", 0))
-                    except Exception as ppo_error:
-                        logger.warning(f"PPO step failed for mini-batch {start_idx}-{end_idx}: {ppo_error}")
-                        continue
-                
-                # Collect metrics (after all mini-batches)
-                total_rewards.extend(combined_rewards.cpu().numpy())
-                total_judge_scores.extend(rlhf_output.judge_scores.cpu().numpy())
-                total_correctness.extend(rlhf_output.ground_truth_correct.cpu().numpy())
-                
-                # Log comprehensive metrics to wandb every log_frequency batches
+                # Store epoch metrics
+                accuracies.append(batch_accuracy)
+                reward_scores.append(batch_reward_score)  # Add reward scores to epoch metrics
+                judge_scores.append(batch_judge_score)
+                combined_rewards.append(batch_combined_reward)
+                policy_losses.append(batch_policy_loss)
+                                
+                # Log batch-level metrics (following MinMax pattern)
                 if self.metrics_logger and batch_idx % self.config.evaluation.log_frequency == 0:
-                    # Compute batch-level metrics
                     batch_metrics = {
-                        'reward': combined_rewards.mean().item(),
-                        'judge_score': rlhf_output.judge_scores.mean().item(),
-                        'policy_accuracy': rlhf_output.ground_truth_correct.float().mean().item(),
-                        'reward_score_mean': rlhf_output.reward_scores.mean().item(),
-                        'combined_reward_mean': combined_rewards.mean().item(),
+                        'combined_reward': batch_combined_reward,
+                        'judge_score': batch_judge_score,
+                        'policy_accuracy': batch_accuracy,
+                        'reward_score_mean': batch_reward_score,
+                        'policy_loss': batch_policy_loss,
                     }
                     
-                    if total_losses:
-                        batch_metrics['ppo_loss'] = total_losses[-1]
-                    
-                    # Compute deception metrics for judge
+                    # Compute judge deception metrics
                     judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
                         rlhf_output.judge_scores, rlhf_output.ground_truth_correct
                     )
@@ -440,24 +526,27 @@ class RLHFTrainer:
                     # Log batch metrics
                     self.metrics_logger.log_training_batch_metrics(batch_metrics)
                 
-                self.metrics_logger.global_train_step += 1
+                if self.metrics_logger:
+                    self.metrics_logger.global_train_step += 1
                 
-                # Log progress
+                # Log progress (use log_frequency consistently like MinMax)
                 if batch_idx % self.config.evaluation.log_frequency == 0:
                     logger.info(f"Batch {batch_idx}: "
-                              f"Reward={np.mean(combined_rewards.cpu().numpy()):.3f}, "
-                              f"Judge={np.mean(rlhf_output.judge_scores.cpu().numpy()):.3f}, "
-                              f"Correct={np.mean(rlhf_output.ground_truth_correct.cpu().numpy()):.3f}")
+                              f"Combined_Reward={batch_combined_reward:.3f}, "
+                              f"Policy_Loss={batch_policy_loss:.3f}, "
+                              f"Judge={batch_judge_score:.3f}, "
+                              f"Accuracy={batch_accuracy:.3f}")
                 
             except Exception as e:
                 logger.error(f"Error in batch {batch_idx}: {e}")
                 continue
         
         return {
-            "mean_reward": float(np.mean(total_rewards)) if total_rewards else 0.0,
-            "mean_judge_score": float(np.mean(total_judge_scores)) if total_judge_scores else 0.0,
-            "mean_correctness": float(np.mean(total_correctness)) if total_correctness else 0.0,
-            "mean_loss": float(np.mean(total_losses)) if total_losses else 0.0
+            "mean_combined_reward": float(np.mean(combined_rewards)) if combined_rewards else 0.0,
+            "mean_reward_score": float(np.mean(reward_scores)) if reward_scores else 0.0,
+            "mean_judge_score": float(np.mean(judge_scores)) if judge_scores else 0.0,
+            "mean_accuracy": float(np.mean(accuracies)) if accuracies else 0.0,
+            "mean_policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0
         }
     
     def evaluate(self):
@@ -472,14 +561,27 @@ class RLHFTrainer:
         all_parsed_answers = []
         batch_metrics_list = []
         
-        self.ppo_model.eval() if hasattr(self, 'ppo_model') else None
+        # Set models to evaluation mode with proper error handling
+        try:
+            if hasattr(self, 'ppo_model'):
+                self.ppo_model.eval()
+                logger.debug("PPO model set to evaluation mode")
+            
+            # Also set underlying models to eval mode for generation
+            self.policy_model.get_model_for_training().eval()
+            self.reward_model.model.eval()
+            self.judge_model.model.eval()
+            logger.debug("All models set to evaluation mode")
+        except Exception as e:
+            logger.warning(f"Failed to set models to evaluation mode: {e}")
         
+        # Evaluation loop with error handling
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dataloader):
                 if batch_idx >= self.config.evaluation.num_eval_samples // \
                    self.config.training.batch_size:
                     break
-                
+            
                 try:
                     # Forward pass for evaluation (no training updates)
                     rlhf_output = self.pipeline.forward_pass(batch, max_new_tokens=50)
@@ -533,6 +635,7 @@ class RLHFTrainer:
         
         # Add judge deception metrics
         if self.metrics_logger:
+            print("Judge Model: ")
             judge_deception_metrics = self.metrics_logger.compute_deception_metrics(
                 judge_scores_tensor, policy_correctness_tensor
             )
@@ -542,6 +645,23 @@ class RLHFTrainer:
             # Add answer distribution
             answer_distribution = self.metrics_logger.compute_answer_distribution(all_parsed_answers)
             aggregated_metrics.update(answer_distribution)
+
+            # Log evaluation metrics
+            self.metrics_logger.log_evaluation_metrics(aggregated_metrics)
+        
+        # Restore training mode after evaluation
+        try:
+            if hasattr(self, 'ppo_model'):
+                self.ppo_model.train()
+                logger.debug("PPO model restored to training mode")
+            
+            # Also restore underlying models to training mode  
+            self.policy_model.get_model_for_training().train()
+            self.reward_model.model.train()
+            self.judge_model.model.train()
+            logger.debug("All models restored to training mode")
+        except Exception as e:
+            logger.warning(f"Failed to restore models to training mode: {e}")
         
         return aggregated_metrics
     
@@ -568,8 +688,8 @@ class RLHFTrainer:
 def main():
     parser = argparse.ArgumentParser(description="Dataset-Agnostic RLHF Training")
     parser.add_argument("--config", type=str, 
-                       default="/data/lhx/minmax_monitor/config/rlhf_config.json",
-                       help="Path to configuration file")
+                       default="config/rlhf_config.json",
+                       help="Path to configuration file (relative to project root)")
     parser.add_argument("--dataset", type=str, default="qa_simple",
                        choices=["qa_simple"],
                        help="Dataset to use for training")
@@ -594,6 +714,9 @@ def main():
         results = {k: (v.item() if hasattr(v, "item") else v)
                 for k, v in results.items()}
         print(json.dumps(results, indent=2))
+        # save evaluation results
+        with open(os.path.join(trainer.save_dir, "evaluation_results.json"), 'w') as f:
+            json.dump(results, f, indent=2)
     else:
         training_stats = trainer.train(num_epochs=args.epochs)
         print("Training completed!")
