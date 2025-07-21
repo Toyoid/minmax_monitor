@@ -46,7 +46,7 @@
     "monitor_learning_rate": 4e-6,
     "monitor_updates_per_policy": 5,
     "constraint_penalty_lambda": 10.0,
-    "constraint_threshold": -0.2,
+    "constraint_threshold": -3.6,
     "dual_ascent_step_size": 0.25,
     "monitor_verdict_weight": 0.6,
     "monitor_reward_weight": 0.4,

@@ -297,9 +297,11 @@ class MinMaxPipeline:
                                 reward_weight: float = 0.5, judge_weight: float = 0.5) -> torch.Tensor:
         """Compute combined reward R(O,O')"""
         # Normalize scores
-        normalized_reward = torch.tanh(reward_scores)
-        normalized_judge = judge_scores  # Assuming judge scores are already normalized
-        
+        # normalized_reward = torch.tanh(reward_scores)
+        # normalized_judge = judge_scores  # Assuming judge scores are already normalized
+        normalized_reward = torch.clamp(reward_scores, -15.0, 15.0)
+        normalized_judge = judge_scores * 5.0
+
         # Combine rewards
         combined_scores = (reward_weight * normalized_reward + 
                           judge_weight * normalized_judge)
@@ -372,16 +374,16 @@ class MinMaxPipeline:
             
             # Monitor verdict penalty: MSE between monitor verdicts and ground truth
             monitor_verdict_penalty = F.mse_loss(monitor_verdicts, ground_truth_correct)
-            # monitor_verdict_penalty = torch.clamp(monitor_verdict_penalty * 4.0, 0.0, 4.0)
+            monitor_verdict_penalty = monitor_verdict_penalty * 15.0
             
             result = {'monitor_verdict_penalty': monitor_verdict_penalty}
             
             if use_monitor_rewards:
                 # Part 2: Monitor reward penalty (new component)
                 # We want monitors to get high reward scores, so penalty = -monitor_reward
-                # Scale to [-1,1] range using tanh normalization
-                monitor_reward_penalty = -torch.tanh(monitor_reward_scores.mean())  # Penalty when rewards are low
+                # monitor_reward_penalty = -torch.tanh(monitor_reward_scores.mean())
                 # monitor_reward_penalty = torch.clamp(monitor_reward_penalty, -4.0, 4.0)
+                monitor_reward_penalty = -torch.clamp(monitor_reward_scores.mean(), -15.0, 15.0)
                 
                 result['monitor_reward_penalty'] = monitor_reward_penalty
                 

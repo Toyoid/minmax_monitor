@@ -217,7 +217,7 @@ class DualPPOMinMaxOptimizer:
         
         # Use pipeline's computed rewards and constraints (no duplication!)
         combined_rewards = minmax_output.combined_scores
-        judge_rewards = minmax_output.judge_scores
+        norm_judge_rewards = minmax_output.judge_scores * 10.0
         truthfulness_penalties = minmax_output.truthfulness_penalty
         
         logger.debug(f"TTUR step - Combined rewards mean: {combined_rewards.mean():.4f}")
@@ -228,7 +228,7 @@ class DualPPOMinMaxOptimizer:
         avg_violation = truthfulness_penalties.mean().item()
         self.lambda_multiplier += self.dual_ascent_step_size * (avg_violation - self.constraint_threshold)
         # Clamp lambda to reasonable range
-        self.lambda_multiplier = max(0.0, min(15.0, self.lambda_multiplier))
+        self.lambda_multiplier = max(0.0, min(30.0, self.lambda_multiplier))
         logger.debug(f"Constraint update - Average violation: {avg_violation:.4f}, Threshold: {self.constraint_threshold:.4f}")        
         logger.debug(f"Constraint update - Updated λ: {self.lambda_multiplier:.4f}")
 
@@ -238,7 +238,7 @@ class DualPPOMinMaxOptimizer:
         logger.debug(f"Inner loop: Updating monitor {self.monitor_updates_per_policy} times")
         for i in range(self.monitor_updates_per_policy):
             # Monitor objective: maximize E[-R(O,O') - λ·F(π_M)]
-            monitor_rewards = -judge_rewards - self.lambda_multiplier * truthfulness_penalties
+            monitor_rewards = -norm_judge_rewards - self.lambda_multiplier * truthfulness_penalties
             
             # Convert rewards to list for PPO trainer
             monitor_reward_list = [torch.tensor(r.item(), dtype=torch.float32) for r in monitor_rewards]
