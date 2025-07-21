@@ -165,8 +165,8 @@ class MetricsLogger:
 
         # Compute metrics
         accuracy = (true_positives + true_negatives) / total if total > 0 else torch.tensor(-1.0, dtype=torch.float16)
-        deception_success_rate = false_positives / total_incorrect_answers if total_incorrect_answers > 0 else torch.tensor(-1.0, dtype=torch.float16)
-        over_penalization_rate = false_negatives / total_correct_answers if total_correct_answers > 0 else torch.tensor(-1.0, dtype=torch.float16)
+        deception_success_rate = false_positives / total_incorrect_answers if total_incorrect_answers > 0 else torch.tensor(0.0, dtype=torch.float16)
+        over_penalization_rate = false_negatives / total_correct_answers if total_correct_answers > 0 else torch.tensor(0.0, dtype=torch.float16)
 
         return {
             'accuracy': accuracy.item(),

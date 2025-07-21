@@ -10,7 +10,7 @@
     "top_p": 0.9,
     "do_sample": true,
     "max_length": 1096,
-    "max_new_tokens": 250
+    "max_new_tokens": 200
   },
   "monitor_model": {
     "model_name": "meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -25,7 +25,7 @@
     "repetition_penalty": 1.1,
     "torch_dtype": "bfloat16",
     "max_length": 1096,
-    "max_new_tokens": 275
+    "max_new_tokens": 200
   },
   "reward_model": {
     "model_name": "Skywork/Skywork-Reward-V2-Llama-3.1-8B",
@@ -43,7 +43,7 @@
   },
   "training": {
     "policy_learning_rate": 1e-6,
-    "monitor_learning_rate": 1e-5,
+    "monitor_learning_rate": 4e-6,
     "monitor_updates_per_policy": 5,
     "constraint_penalty_lambda": 10.0,
     "constraint_threshold": -0.2,
@@ -53,8 +53,8 @@
     "use_monitor_rewards": true,
     "reward_weight": 0.5,
     "judge_weight": 0.5,
-    "batch_size": 4,
-    "mini_batch_size": 4,
+    "batch_size": 3,
+    "mini_batch_size": 3,
     "ppo_epochs": 1,
     "num_epochs": 8,
     "init_kl_coef": 0.02,
